@@ -146,6 +146,12 @@ function generateCubeDef(table, allSelectedTables = [], options = {}) {
     const cubeName = toCubeName(table.name);
     const autoJoins = options.autoJoins !== false;
     const autoMeasures = options.autoMeasures !== false;
+    // Determine which target cube names exist or will exist after this import
+    const selectedCubeNames = new Set(allSelectedTables.map(t => toCubeName(t.name)));
+    const existingCubeNames = options.existingCubeNames instanceof Set
+        ? options.existingCubeNames
+        : new Set(options.existingCubeNames || []);
+    const availableCubeNames = new Set([...selectedCubeNames, ...existingCubeNames]);
     // 1. Dimensions
     const dimensions = table.columns.map(col => {
         let type = 'string';
@@ -205,25 +211,37 @@ function generateCubeDef(table, allSelectedTables = [], options = {}) {
             }
         }
     }
-    // 3. Joins from Foreign Keys
+    // 3. Joins from Foreign Keys (safely filtered by available cubes)
     const joins = [];
+    const skippedJoins = [];
     if (autoJoins && table.foreignKeys && table.foreignKeys.length > 0) {
         for (const fk of table.foreignKeys) {
             const targetCubeName = toCubeName(fk.foreignTable);
-            // Avoid self-joins in simple auto-generation
-            if (targetCubeName !== cubeName) {
+            // Avoid self-joins
+            if (targetCubeName === cubeName) {
+                continue;
+            }
+            // CRITICAL: Only generate joins to cubes that are in the import batch OR already exist in VAS
+            if (availableCubeNames.has(targetCubeName)) {
                 joins.push({
                     name: targetCubeName,
                     sql: `{CUBE}.${fk.column} = {${targetCubeName}.${fk.foreignColumn}}`,
                     relationship: 'many_to_one',
                 });
             }
+            else {
+                skippedJoins.push(`Join for ${table.name}.${fk.column} -> ${fk.foreignTable}.${fk.foreignColumn} skipped because target cube '${targetCubeName}' is not in the import batch or existing models.`);
+            }
         }
     }
     const cubeObj = {
         name: cubeName,
-        sql_table: `${table.schema}.${table.name}`,
     };
+    // Add data_source property if targeting an external data source
+    if (options.dataSource && options.dataSource !== 'default') {
+        cubeObj.data_source = options.dataSource;
+    }
+    cubeObj.sql_table = `${table.schema}.${table.name}`;
     if (joins.length > 0) {
         cubeObj.joins = joins;
     }
@@ -238,6 +256,7 @@ function generateCubeDef(table, allSelectedTables = [], options = {}) {
         fileName: `${cubeName}.cube.yml`,
         yaml,
         parsed: fullDefinition,
+        skippedJoins: skippedJoins.length > 0 ? skippedJoins : undefined,
     };
 }
 //# sourceMappingURL=introspect.js.map

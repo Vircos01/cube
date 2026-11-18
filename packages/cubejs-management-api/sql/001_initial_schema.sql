@@ -62,3 +62,22 @@ CREATE TABLE IF NOT EXISTS schema_version_tracker (
 INSERT INTO schema_version_tracker (id, version, version_hash, updated_at)
 VALUES (1, 1, 'initial', NOW())
 ON CONFLICT (id) DO NOTHING;
+
+-- Table 5: Data Sources (External & Custom Database Connections for Cube driverFactory)
+CREATE TABLE IF NOT EXISTS data_sources (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(128) NOT NULL UNIQUE,
+    db_type VARCHAR(64) NOT NULL DEFAULT 'postgres',
+    host VARCHAR(255) NOT NULL,
+    port INT NOT NULL DEFAULT 5432,
+    database_name VARCHAR(255) NOT NULL,
+    username VARCHAR(255) NOT NULL,
+    password TEXT,
+    schema_name VARCHAR(255) DEFAULT 'public',
+    ssl BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_data_sources_name ON data_sources(name);
+

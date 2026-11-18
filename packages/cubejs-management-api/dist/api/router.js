@@ -42,6 +42,7 @@ const path_1 = __importDefault(require("path"));
 const pg_1 = require("pg");
 const modelStore_1 = require("../repository/modelStore");
 const validator_1 = require("../compiler/validator");
+const dataSourceStore_1 = require("../repository/dataSourceStore");
 const introspect_1 = require("./introspect");
 const auth_1 = require("./auth");
 const fileMigrator_1 = require("../repository/fileMigrator");
@@ -267,51 +268,107 @@ function createManagementRouter(pool, options = {}) {
     };
     router.get('/datasources/introspect', handleIntrospect);
     router.post('/datasources/introspect', handleIntrospect);
-    // POST /datasources/generate-cubes - Batch generate cubes from selected tables with FK joins and measures
+    // GET /datasources - List all registered external data sources
+    router.get('/datasources', async (req, res) => {
+        try {
+            const dataSources = await (0, dataSourceStore_1.listDataSources)(pool);
+            res.json(dataSources);
+        }
+        catch (err) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+    // POST /datasources/generate-cubes - Batch generate cubes from selected tables with FK joins, measures, and data sources
     router.post('/datasources/generate-cubes', async (req, res) => {
         try {
-            const { tables, options = {} } = req.body;
+            const { tables, options = {}, connection, dataSourceName } = req.body;
             if (!tables || !Array.isArray(tables) || tables.length === 0) {
                 res.status(400).json({ error: 'Array of "tables" is required' });
                 return;
             }
             const actor = req.user?.actor || 'VAS Data Source Explorer';
-            const results = [];
-            for (const table of tables) {
-                const gen = (0, introspect_1.generateCubeDef)(table, tables, options);
-                // Check if model already exists
-                const existing = await pool.query('SELECT id FROM semantic_models WHERE name = $1', [gen.cubeName]);
-                let modelRecord;
-                if (existing.rows.length > 0) {
-                    modelRecord = await (0, modelStore_1.updateModel)(pool, existing.rows[0].id, {
-                        content: gen.yaml,
-                        change_summary: `Imported/Re-generated from database table ${table.schema}.${table.name}`,
-                        actor
-                    });
-                }
-                else {
-                    modelRecord = await (0, modelStore_1.createModel)(pool, {
-                        name: gen.cubeName,
-                        file_name: gen.fileName,
-                        model_type: 'cube',
-                        content: gen.yaml,
-                        description: `Generated from table ${table.schema}.${table.name}`,
-                        change_summary: `Initial import from table ${table.schema}.${table.name}`,
-                        actor
-                    });
-                }
-                results.push({
-                    model: modelRecord,
-                    cubeName: gen.cubeName,
-                    fileName: gen.fileName,
-                    table: `${table.schema}.${table.name}`,
-                    isUpdate: existing.rows.length > 0
+            // 1. Handle external data source registration if connection configuration is provided
+            let targetDataSource = undefined;
+            if (connection && connection.host) {
+                // Derive clean data source identifier
+                const rawDsName = (dataSourceName || connection.dataSourceName || connection.database || 'remote_postgres');
+                const dsName = rawDsName.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+                targetDataSource = dsName;
+                // Upsert into data_sources table so Cube runtime driverFactory can resolve it
+                await (0, dataSourceStore_1.upsertDataSource)(pool, {
+                    name: dsName,
+                    db_type: connection.type || 'postgres',
+                    host: connection.host,
+                    port: connection.port || 5432,
+                    database_name: connection.database || connection.database_name || 'postgres',
+                    username: connection.user || connection.username || 'postgres',
+                    password: connection.password || '',
+                    schema_name: connection.schema || 'public',
+                    ssl: !!connection.ssl,
                 });
             }
+            // 2. Fetch all existing active models to check join targets and for validation
+            const existingActiveRes = await pool.query(`
+        SELECT sm.name, sm.file_name, mr.content
+        FROM semantic_models sm
+        JOIN model_revisions mr ON sm.id = mr.model_id
+        WHERE sm.is_active = true AND mr.status = 'active'
+      `);
+            const existingFiles = existingActiveRes.rows.map(r => ({
+                fileName: r.file_name,
+                content: r.content,
+                readOnly: false,
+            }));
+            const existingCubeNames = new Set(existingActiveRes.rows.map(r => r.name));
+            // 3. Generate Cube definitions safely (only generating joins to available cubes)
+            const generatedItems = [];
+            for (const table of tables) {
+                const gen = (0, introspect_1.generateCubeDef)(table, tables, {
+                    ...options,
+                    existingCubeNames,
+                    dataSource: targetDataSource,
+                });
+                generatedItems.push({ table, gen });
+            }
+            // 4. Pre-validate the entire batch together with existing models
+            const newFilesForValidation = generatedItems.map(g => ({
+                fileName: g.gen.fileName,
+                content: g.gen.yaml,
+            }));
+            const batchValidation = await (0, validator_1.validateBatchSchemas)(newFilesForValidation, existingFiles);
+            if (!batchValidation.valid) {
+                res.status(400).json({
+                    error: 'Batch schema validation failed',
+                    validationErrors: batchValidation.errors,
+                    warnings: batchValidation.warnings,
+                });
+                return;
+            }
+            // 5. Atomic Batch Upsert in a single transaction with ONE schemaVersion bump
+            const batchItems = generatedItems.map(({ table, gen }) => ({
+                name: gen.cubeName,
+                file_name: gen.fileName,
+                model_type: 'cube',
+                content: gen.yaml,
+                description: `Generated from table ${table.schema}.${table.name}${targetDataSource ? ` (Data source: ${targetDataSource})` : ''}`,
+                change_summary: `Imported from database table ${table.schema}.${table.name}${targetDataSource ? ` via ${targetDataSource}` : ''}`,
+            }));
+            const upserted = await (0, modelStore_1.batchUpsertModels)(pool, batchItems, actor);
+            const results = upserted.map((u, i) => ({
+                model: u.model,
+                revision: u.revision,
+                cubeName: generatedItems[i].gen.cubeName,
+                fileName: generatedItems[i].gen.fileName,
+                table: `${generatedItems[i].table.schema}.${generatedItems[i].table.name}`,
+                isUpdate: u.isUpdate,
+                skippedJoins: generatedItems[i].gen.skippedJoins,
+                dataSource: targetDataSource || 'default',
+            }));
             res.json({
                 success: true,
                 count: results.length,
-                imported: results
+                dataSource: targetDataSource || 'default',
+                imported: results,
             });
         }
         catch (err) {

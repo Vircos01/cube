@@ -8,4 +8,8 @@ export declare class MemorySchemaRepository implements SchemaFileRepository {
     dataSchemaFiles(): Promise<FileContent[]>;
 }
 export declare function validateSchemaContent(content: string, fileName?: string, existingFiles?: FileContent[], dialect?: string): Promise<ValidationResult>;
+export declare function validateBatchSchemas(newFiles: Array<{
+    fileName: string;
+    content: string;
+}>, existingFiles?: FileContent[], dialect?: string): Promise<ValidationResult>;
 //# sourceMappingURL=validator.d.ts.map

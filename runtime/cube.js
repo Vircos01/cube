@@ -26,6 +26,50 @@ try {
 }
 
 module.exports = {
+  // Dynamic driverFactory supporting multi-database / external data sources
+  driverFactory: async (context) => {
+    const dataSource = context.dataSource || 'default';
+    if (dataSource === 'default') {
+      return {
+        type: process.env.CUBEJS_DB_TYPE || 'postgres',
+        host: process.env.CUBEJS_DB_HOST || 'localhost',
+        port: parseInt(process.env.CUBEJS_DB_PORT || '5432', 10),
+        database: process.env.CUBEJS_DB_NAME || 'cubedb',
+        user: process.env.CUBEJS_DB_USER || 'postgres',
+        password: process.env.CUBEJS_DB_PASS || 'postgres',
+      };
+    }
+
+    try {
+      const res = await pool.query('SELECT * FROM data_sources WHERE name = $1', [dataSource]);
+      if (res.rows.length > 0) {
+        const ds = res.rows[0];
+        console.log(`[driverFactory] Resolving external data source '${dataSource}' -> ${ds.host}:${ds.port}/${ds.database_name}`);
+        return {
+          type: ds.db_type || 'postgres',
+          host: ds.host,
+          port: ds.port,
+          database: ds.database_name,
+          user: ds.username,
+          password: ds.password,
+          ssl: ds.ssl ? { rejectUnauthorized: false } : false,
+        };
+      }
+      console.warn(`[driverFactory] Data source '${dataSource}' not found in metadata database, falling back to default`);
+    } catch (err) {
+      console.error(`[driverFactory] Error looking up data source '${dataSource}':`, err.message);
+    }
+
+    return {
+      type: process.env.CUBEJS_DB_TYPE || 'postgres',
+      host: process.env.CUBEJS_DB_HOST || 'localhost',
+      port: parseInt(process.env.CUBEJS_DB_PORT || '5432', 10),
+      database: process.env.CUBEJS_DB_NAME || 'cubedb',
+      user: process.env.CUBEJS_DB_USER || 'postgres',
+      password: process.env.CUBEJS_DB_PASS || 'postgres',
+    };
+  },
+
   // Custom repositoryFactory fetching active YAML definitions from PostgreSQL
   repositoryFactory: (context) => ({
     localPath: () => '/cube/conf/schema',

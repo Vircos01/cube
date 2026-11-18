@@ -129,3 +129,31 @@ export interface DatabaseConfig {
   ssl?: boolean | any;
   max?: number;
 }
+
+export interface DataSourceRecord {
+  id: string;
+  name: string;
+  db_type: string;
+  host: string;
+  port: number;
+  database_name: string;
+  username: string;
+  password?: string;
+  schema_name?: string;
+  ssl: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface CreateDataSourceInput {
+  name: string;
+  db_type?: string;
+  host: string;
+  port: number;
+  database_name: string;
+  username: string;
+  password?: string;
+  schema_name?: string;
+  ssl?: boolean;
+}
+

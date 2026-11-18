@@ -383,3 +383,141 @@ export async function deleteModel(
     await bumpSchemaVersion(client);
   });
 }
+
+export interface BatchModelItem {
+  name: string;
+  file_name?: string;
+  model_type?: ModelType;
+  description?: string;
+  content: string;
+  content_format?: 'yaml' | 'json';
+  change_summary?: string;
+}
+
+export interface BatchUpsertResultItem {
+  model: SemanticModel;
+  revision: ModelRevision;
+  isUpdate: boolean;
+}
+
+export async function batchUpsertModels(
+  pool: Pool,
+  items: BatchModelItem[],
+  actor: string = 'system'
+): Promise<BatchUpsertResultItem[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  return withTransaction(pool, async (client) => {
+    const results: BatchUpsertResultItem[] = [];
+
+    for (const item of items) {
+      const modelType = item.model_type || 'cube';
+      const fileName = item.file_name || `${item.name}.${modelType}.yml`;
+      const format = item.content_format || 'yaml';
+
+      let parsedJson: any = null;
+      try {
+        parsedJson = format === 'yaml' ? yaml.load(item.content) : JSON.parse(item.content);
+      } catch {
+        // Ignored if unparseable
+      }
+
+      // Check if model already exists
+      const existing = await client.query('SELECT * FROM semantic_models WHERE name = $1', [item.name]);
+
+      if (existing.rows.length > 0) {
+        const modelId = existing.rows[0].id;
+
+        // Archive existing active revisions
+        await client.query("UPDATE model_revisions SET status = 'archived' WHERE model_id = $1 AND status = 'active'", [modelId]);
+
+        // Determine next revision number
+        const maxRevRes = await client.query('SELECT COALESCE(MAX(revision_number), 0) AS max_rev FROM model_revisions WHERE model_id = $1', [modelId]);
+        const nextRevNum = parseInt(maxRevRes.rows[0].max_rev, 10) + 1;
+
+        // Insert new active revision
+        const revRes = await client.query(`
+          INSERT INTO model_revisions (
+            model_id, revision_number, content, content_format, parsed_json, change_summary, status, created_by
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, 'active', $7)
+          RETURNING *
+        `, [
+          modelId,
+          nextRevNum,
+          item.content,
+          format,
+          parsedJson ? JSON.stringify(parsedJson) : null,
+          item.change_summary || `Batch revision ${nextRevNum}`,
+          actor
+        ]);
+
+        // Update model metadata
+        const updatedModelRes = await client.query(`
+          UPDATE semantic_models
+          SET updated_at = NOW(),
+              description = COALESCE($2, description),
+              is_active = true
+          WHERE id = $1
+          RETURNING *
+        `, [modelId, item.description || null]);
+
+        // Audit log
+        await client.query(`
+          INSERT INTO audit_logs (action, model_name, revision_id, details, actor)
+          VALUES ('UPDATE', $1, $2, $3, $4)
+        `, [item.name, revRes.rows[0].id, JSON.stringify({ revisionNumber: nextRevNum, changeSummary: item.change_summary }), actor]);
+
+        results.push({
+          model: updatedModelRes.rows[0],
+          revision: revRes.rows[0],
+          isUpdate: true,
+        });
+      } else {
+        // Insert new semantic model
+        const modelRes = await client.query(`
+          INSERT INTO semantic_models (name, model_type, file_name, description, is_active)
+          VALUES ($1, $2, $3, $4, true)
+          RETURNING *
+        `, [item.name, modelType, fileName, item.description || null]);
+        const model = modelRes.rows[0];
+
+        // Insert revision 1
+        const revRes = await client.query(`
+          INSERT INTO model_revisions (
+            model_id, revision_number, content, content_format, parsed_json, change_summary, status, created_by
+          )
+          VALUES ($1, 1, $2, $3, $4, $5, 'active', $6)
+          RETURNING *
+        `, [
+          model.id,
+          item.content,
+          format,
+          parsedJson ? JSON.stringify(parsedJson) : null,
+          item.change_summary || 'Initial creation (batch import)',
+          actor
+        ]);
+
+        // Audit log
+        await client.query(`
+          INSERT INTO audit_logs (action, model_name, revision_id, details, actor)
+          VALUES ('CREATE', $1, $2, $3, $4)
+        `, [item.name, revRes.rows[0].id, JSON.stringify({ fileName, modelType }), actor]);
+
+        results.push({
+          model,
+          revision: revRes.rows[0],
+          isUpdate: false,
+        });
+      }
+    }
+
+    // Atomic schemaVersion bump: EXACTLY ONCE for the entire batch
+    await bumpSchemaVersion(client);
+
+    return results;
+  });
+}
+

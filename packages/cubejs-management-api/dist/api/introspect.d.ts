@@ -9,13 +9,17 @@ export declare function testDatabaseConnection(config: DatabaseConnectionConfig)
     error?: string;
 }>;
 export declare function introspectPostgresDatabase(poolOrClient: Pool | Client, schema?: string): Promise<IntrospectResult>;
-export declare function generateCubeDef(table: IntrospectTable, allSelectedTables?: IntrospectTable[], options?: {
+export interface GenerateCubeOptions {
     autoJoins?: boolean;
     autoMeasures?: boolean;
-}): {
+    dataSource?: string;
+    existingCubeNames?: string[] | Set<string>;
+}
+export declare function generateCubeDef(table: IntrospectTable, allSelectedTables?: IntrospectTable[], options?: GenerateCubeOptions): {
     cubeName: string;
     fileName: string;
     yaml: string;
     parsed: any;
+    skippedJoins?: string[];
 };
 //# sourceMappingURL=introspect.d.ts.map

@@ -46,7 +46,7 @@
       const [saving, setSaving] = useState(false);
       const [notification, setNotification] = useState(null);
       
-      // Data Source & Playground state
+      // Data Source state
       const [dbTables, setDbTables] = useState([]);
       const [loadingIntrospect, setLoadingIntrospect] = useState(false);
       const [selectedTableNames, setSelectedTableNames] = useState([]);
@@ -61,6 +61,7 @@
         schema: 'public',
         ssl: false
       });
+      const [customDsName, setCustomDsName] = useState('remote_dwh');
       const [connTestResult, setConnTestResult] = useState(null);
       const [testingConn, setTestingConn] = useState(false);
       const [autoJoins, setAutoJoins] = useState(true);
@@ -306,17 +307,23 @@
 
         setGeneratingBatch(true);
         try {
+          const isCustom = activeSourceMode === 'custom';
+          const payload = {
+            tables: selected,
+            options: { autoJoins, autoMeasures },
+            connection: isCustom ? customConn : undefined,
+            dataSourceName: isCustom ? (customDsName || 'remote_dwh') : undefined,
+          };
+
           const res = await fetch('/management/v1/datasources/generate-cubes', {
             method: 'POST',
             headers: getHeaders(),
-            body: JSON.stringify({
-              tables: selected,
-              options: { autoJoins, autoMeasures }
-            })
+            body: JSON.stringify(payload)
           });
           const data = await res.json();
           if (res.ok) {
-            notify(`✓ Successfully generated & imported ${data.count} models into VAS!`);
+            const dsLabel = data.dataSource !== 'default' ? ` (Data source: ${data.dataSource})` : '';
+            notify(`✓ Successfully generated & atomically imported ${data.count} models into VAS${dsLabel}!`);
             fetchHealth();
             await fetchModels();
             if (data.imported && data.imported.length > 0) {
@@ -324,7 +331,8 @@
             }
             setActiveTab('editor');
           } else {
-            notify(`Import failed: ${data.error}`, 'error');
+            const validationDetails = data.validationErrors ? ': ' + data.validationErrors.map(e => e.message).join('; ') : '';
+            notify(`Import failed: ${data.error}${validationDetails}`, 'error');
           }
         } catch (e) {
           notify(`Import error: ${e.message}`, 'error');
@@ -337,23 +345,30 @@
       const generateCubeFromTable = async (table) => {
         setGeneratingBatch(true);
         try {
+          const isCustom = activeSourceMode === 'custom';
+          const payload = {
+            tables: [table],
+            options: { autoJoins, autoMeasures },
+            connection: isCustom ? customConn : undefined,
+            dataSourceName: isCustom ? (customDsName || 'remote_dwh') : undefined,
+          };
+
           const res = await fetch('/management/v1/datasources/generate-cubes', {
             method: 'POST',
             headers: getHeaders(),
-            body: JSON.stringify({
-              tables: [table],
-              options: { autoJoins, autoMeasures }
-            })
+            body: JSON.stringify(payload)
           });
           const data = await res.json();
           if (res.ok && data.imported && data.imported.length > 0) {
-            notify(`✓ Cube ${data.imported[0].cubeName} generated from table ${table.name}!`);
+            const dsLabel = data.dataSource !== 'default' ? ` (Data source: ${data.dataSource})` : '';
+            notify(`✓ Cube ${data.imported[0].cubeName} generated from table ${table.name}${dsLabel}!`);
             fetchHealth();
             await fetchModels();
             selectModel(data.imported[0].model.id);
             setActiveTab('editor');
           } else {
-            notify(`Failed: ${data.error}`, 'error');
+            const validationDetails = data.validationErrors ? ': ' + data.validationErrors.map(e => e.message).join('; ') : '';
+            notify(`Failed: ${data.error}${validationDetails}`, 'error');
           }
         } catch (e) {
           notify(`Error: ${e.message}`, 'error');
@@ -1696,7 +1711,7 @@
                 </div>
               )}
 
-              {/* TAB: DATA SOURCES & PLAYGROUND */}
+              {/* TAB: DATA SOURCES & TABELLEN */}
               {activeTab === 'introspect' && (
                 <div className="flex-1 overflow-y-auto p-6 space-y-6">
                   {/* Top Header Banner */}
@@ -1829,6 +1844,16 @@
                             placeholder="••••••••"
                           />
                         </div>
+                        <div>
+                          <label className="text-slate-400 block mb-1">VAS Data Source ID (voor Cube)</label>
+                          <input
+                            type="text"
+                            value={customDsName}
+                            onChange={(e) => setCustomDsName(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+                            placeholder="remote_dwh"
+                          />
+                        </div>
                         <div className="flex items-center space-x-2 pt-6">
                           <input
                             type="checkbox"
@@ -1862,7 +1887,7 @@
                     </div>
                   )}
 
-                  {/* Playground Toolbar (Search, Filter, Options & Batch Generate Button) */}
+                  {/* Data Source Toolbar (Search, Filter, Options & Batch Generate Button) */}
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
                     <div className="flex items-center space-x-3">
                       {/* Search box */}
