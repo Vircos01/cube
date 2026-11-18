@@ -50,6 +50,8 @@ const fileMigrator_1 = require("../repository/fileMigrator");
 const gitService_1 = require("../git/gitService");
 const securityStore_1 = require("../repository/securityStore");
 const password_1 = require("../security/password");
+const health_1 = require("../observability/health");
+const metrics_1 = require("../observability/metrics");
 function createManagementRouter(pool, options = {}) {
     // Production Secret Safety Check (Fase 3: Eis 83)
     // Voorkom dat de service in productie start met de bekende standaardsecret 'mysecretkey123'
@@ -68,14 +70,47 @@ function createManagementRouter(pool, options = {}) {
     router.get('/admin*', (req, res) => {
         res.sendFile(path_1.default.join(publicDir, 'index.html'));
     });
-    // Health check
+    // Health & Liveness / Readiness Probes (Unauthenticated for K8s / load balancers)
     router.get('/health', async (req, res) => {
         try {
-            const version = await (0, modelStore_1.getSchemaVersion)(pool);
-            res.json({ status: 'ok', schemaVersion: version });
+            const check = await (0, health_1.performHealthCheck)(pool);
+            if (check.status === 'ok') {
+                res.json(check);
+            }
+            else {
+                res.status(503).json(check);
+            }
         }
         catch (err) {
-            res.status(500).json({ status: 'error', error: err.message });
+            res.status(503).json({ status: 'unhealthy', error: err.message });
+        }
+    });
+    router.get('/health/live', (req, res) => {
+        res.json({ status: 'ok', uptimeSeconds: Math.floor(process.uptime()) });
+    });
+    router.get('/health/ready', async (req, res) => {
+        try {
+            const check = await (0, health_1.performHealthCheck)(pool);
+            if (check.status === 'ok') {
+                res.json({ ready: true, ...check });
+            }
+            else {
+                res.status(503).json({ ready: false, ...check });
+            }
+        }
+        catch (err) {
+            res.status(503).json({ ready: false, error: err.message });
+        }
+    });
+    // Prometheus & JSON Metrics endpoint (Unauthenticated for scrapers)
+    router.get('/metrics', (req, res) => {
+        const accept = req.headers.accept || '';
+        if (accept.includes('text/plain') || req.query.format === 'prometheus') {
+            res.setHeader('Content-Type', 'text/plain; version=0.0.4');
+            res.send(metrics_1.metrics.getPrometheusText());
+        }
+        else {
+            res.json(metrics_1.metrics.getSummaryJson());
         }
     });
     // Apply authentication to all following endpoints
@@ -113,8 +148,10 @@ function createManagementRouter(pool, options = {}) {
                 res.status(400).json({ error: 'Field "content" is required for validation' });
                 return;
             }
+            const valStart = Date.now();
             const existingFiles = await (0, modelStore_1.getActiveSchemaFiles)(pool);
             const result = await (0, validator_1.validateSchemaContent)(content, fileName, existingFiles, dialect);
+            metrics_1.metrics.recordCompilerValidation(result.valid, Date.now() - valStart);
             res.json(result);
         }
         catch (err) {
@@ -445,6 +482,12 @@ function createManagementRouter(pool, options = {}) {
                 res.status(400).json({ error: 'Array of "tables" is required' });
                 return;
             }
+            if (tables.length > 50) {
+                res.status(400).json({
+                    error: 'Importlimiet overschreden: maximaal 50 tabellen per batch import toegestaan om overbelasting te voorkomen.'
+                });
+                return;
+            }
             const effectiveDataSource = dataSource || (connection && connection.host ? (dataSourceName || connection.database || 'remote_postgres') : undefined);
             const cleanDsName = effectiveDataSource && effectiveDataSource !== 'default'
                 ? effectiveDataSource.toLowerCase().replace(/[^a-z0-9_]/g, '_')
@@ -493,7 +536,9 @@ function createManagementRouter(pool, options = {}) {
                 });
             }
             // 3. Pre-validate against compiler
+            const valStart = Date.now();
             const validation = await (0, validator_1.validateBatchSchemas)(newFilesForValidation, existingFiles);
+            metrics_1.metrics.recordCompilerValidation(validation.valid, Date.now() - valStart);
             res.json({
                 success: true,
                 valid: validation.valid,
@@ -518,6 +563,12 @@ function createManagementRouter(pool, options = {}) {
             const { tables, options = {}, connection, dataSourceName, dataSource } = req.body;
             if (!tables || !Array.isArray(tables) || tables.length === 0) {
                 res.status(400).json({ error: 'Array of "tables" is required' });
+                return;
+            }
+            if (tables.length > 50) {
+                res.status(400).json({
+                    error: 'Importlimiet overschreden: maximaal 50 tabellen per batch import toegestaan om overbelasting te voorkomen.'
+                });
                 return;
             }
             const actor = req.user?.actor || 'VAS Data Source Explorer';
@@ -572,7 +623,9 @@ function createManagementRouter(pool, options = {}) {
                 fileName: g.gen.fileName,
                 content: g.gen.yaml,
             }));
+            const valStart = Date.now();
             const batchValidation = await (0, validator_1.validateBatchSchemas)(newFilesForValidation, existingFiles);
+            metrics_1.metrics.recordCompilerValidation(batchValidation.valid, Date.now() - valStart);
             if (!batchValidation.valid) {
                 res.status(400).json({
                     error: 'Batch schema validation failed',

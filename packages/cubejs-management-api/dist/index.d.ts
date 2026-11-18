@@ -14,4 +14,7 @@ export * from './api/auth';
 export * from './api/router';
 export * from './api/server';
 export * from './api/introspect';
+export * from './observability/logger';
+export * from './observability/metrics';
+export * from './observability/health';
 //# sourceMappingURL=index.d.ts.map

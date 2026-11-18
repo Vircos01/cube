@@ -127,6 +127,9 @@ export interface DatabaseConfig {
     database?: string;
     ssl?: boolean | any;
     max?: number;
+    connectionTimeoutMillis?: number;
+    idleTimeoutMillis?: number;
+    statement_timeout?: number;
 }
 export interface DataSourceRecord {
     id: string;

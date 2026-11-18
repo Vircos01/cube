@@ -19,14 +19,25 @@ describe('Management REST API', () => {
   });
 
   it('GET /health returns status ok and schema version without auth', async () => {
-    mockPool.query.mockResolvedValueOnce({
-      rows: [{ version: 5, version_hash: 'abc', updated_at: '2026-11-18T10:00:00Z' }],
-    });
+    mockPool.query
+      .mockResolvedValueOnce({ rows: [{ '?column?': 1 }] }) // ping
+      .mockResolvedValueOnce({ rows: [{ count: '3' }] }) // models count
+      .mockResolvedValueOnce({
+        rows: [{ version: 5, version_hash: 'abc', updated_at: '2026-11-18T10:00:00Z' }],
+      });
 
     const res = await request(app).get('/management/v1/health');
     expect(res.status).toBe(200);
     expect(res.body.status).toBe('ok');
     expect(res.body.schemaVersion).toContain('v5_abc');
+    expect(res.body.database.connected).toBe(true);
+  });
+
+  it('GET /metrics returns metrics summary without auth', async () => {
+    const res = await request(app).get('/management/v1/metrics');
+    expect(res.status).toBe(200);
+    expect(res.body.service).toBe('voxel-analytics-service');
+    expect(res.body.memory).toBeDefined();
   });
 
   it('GET /models rejects with 401 when unauthenticated and dev mode is false', async () => {

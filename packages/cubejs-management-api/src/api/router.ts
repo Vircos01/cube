@@ -46,6 +46,9 @@ import {
   deletePolicy,
 } from '../repository/securityStore';
 import { verifyPassword } from '../security/password';
+import { performHealthCheck } from '../observability/health';
+import { metrics } from '../observability/metrics';
+import { logger } from '../observability/logger';
 
 export function createManagementRouter(pool: Pool, options: { apiSecret?: string; gitService?: GitService } = {}): Router {
   // Production Secret Safety Check (Fase 3: Eis 83)
@@ -70,13 +73,45 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 
-  // Health check
+  // Health & Liveness / Readiness Probes (Unauthenticated for K8s / load balancers)
   router.get('/health', async (req, res) => {
     try {
-      const version = await getSchemaVersion(pool);
-      res.json({ status: 'ok', schemaVersion: version });
+      const check = await performHealthCheck(pool);
+      if (check.status === 'ok') {
+        res.json(check);
+      } else {
+        res.status(503).json(check);
+      }
     } catch (err: any) {
-      res.status(500).json({ status: 'error', error: err.message });
+      res.status(503).json({ status: 'unhealthy', error: err.message });
+    }
+  });
+
+  router.get('/health/live', (req, res) => {
+    res.json({ status: 'ok', uptimeSeconds: Math.floor(process.uptime()) });
+  });
+
+  router.get('/health/ready', async (req, res) => {
+    try {
+      const check = await performHealthCheck(pool);
+      if (check.status === 'ok') {
+        res.json({ ready: true, ...check });
+      } else {
+        res.status(503).json({ ready: false, ...check });
+      }
+    } catch (err: any) {
+      res.status(503).json({ ready: false, error: err.message });
+    }
+  });
+
+  // Prometheus & JSON Metrics endpoint (Unauthenticated for scrapers)
+  router.get('/metrics', (req, res) => {
+    const accept = req.headers.accept || '';
+    if (accept.includes('text/plain') || req.query.format === 'prometheus') {
+      res.setHeader('Content-Type', 'text/plain; version=0.0.4');
+      res.send(metrics.getPrometheusText());
+    } else {
+      res.json(metrics.getSummaryJson());
     }
   });
 
@@ -117,8 +152,10 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
         return;
       }
 
+      const valStart = Date.now();
       const existingFiles = await getActiveSchemaFiles(pool);
       const result = await validateSchemaContent(content, fileName, existingFiles, dialect);
+      metrics.recordCompilerValidation(result.valid, Date.now() - valStart);
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ valid: false, errors: [{ message: err.message, code: 'VALIDATION_EXCEPTION' }] });
@@ -487,6 +524,13 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
         return;
       }
 
+      if (tables.length > 50) {
+        res.status(400).json({
+          error: 'Importlimiet overschreden: maximaal 50 tabellen per batch import toegestaan om overbelasting te voorkomen.'
+        });
+        return;
+      }
+
       const effectiveDataSource = dataSource || (connection && connection.host ? (dataSourceName || connection.database || 'remote_postgres') : undefined);
       const cleanDsName = effectiveDataSource && effectiveDataSource !== 'default'
         ? effectiveDataSource.toLowerCase().replace(/[^a-z0-9_]/g, '_')
@@ -542,7 +586,9 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
       }
 
       // 3. Pre-validate against compiler
+      const valStart = Date.now();
       const validation = await validateBatchSchemas(newFilesForValidation, existingFiles);
+      metrics.recordCompilerValidation(validation.valid, Date.now() - valStart);
 
       res.json({
         success: true,
@@ -568,6 +614,13 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
       const { tables, options = {}, connection, dataSourceName, dataSource } = req.body;
       if (!tables || !Array.isArray(tables) || tables.length === 0) {
         res.status(400).json({ error: 'Array of "tables" is required' });
+        return;
+      }
+
+      if (tables.length > 50) {
+        res.status(400).json({
+          error: 'Importlimiet overschreden: maximaal 50 tabellen per batch import toegestaan om overbelasting te voorkomen.'
+        });
         return;
       }
 
@@ -632,7 +685,9 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
         content: g.gen.yaml,
       }));
 
+      const valStart = Date.now();
       const batchValidation = await validateBatchSchemas(newFilesForValidation, existingFiles);
+      metrics.recordCompilerValidation(batchValidation.valid, Date.now() - valStart);
       if (!batchValidation.valid) {
         res.status(400).json({
           error: 'Batch schema validation failed',

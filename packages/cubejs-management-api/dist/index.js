@@ -30,4 +30,7 @@ __exportStar(require("./api/auth"), exports);
 __exportStar(require("./api/router"), exports);
 __exportStar(require("./api/server"), exports);
 __exportStar(require("./api/introspect"), exports);
+__exportStar(require("./observability/logger"), exports);
+__exportStar(require("./observability/metrics"), exports);
+__exportStar(require("./observability/health"), exports);
 //# sourceMappingURL=index.js.map

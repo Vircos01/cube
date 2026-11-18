@@ -8,6 +8,10 @@ const pool = new Pool({
   user: process.env.CUBEJS_DB_USER || 'postgres',
   password: process.env.CUBEJS_DB_PASS || 'postgres',
   database: process.env.CUBEJS_DB_NAME || 'cubedb',
+  max: parseInt(process.env.PG_POOL_MAX || '20', 10),
+  idleTimeoutMillis: parseInt(process.env.PG_IDLE_TIMEOUT_MS || '30000', 10),
+  connectionTimeoutMillis: parseInt(process.env.PG_CONN_TIMEOUT_MS || '5000', 10),
+  statement_timeout: parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || '30000', 10),
 });
 
 // Helper for constant-time password verification using scrypt
@@ -114,8 +118,10 @@ module.exports = {
           readOnly: false,
         }));
       } catch (err) {
-        console.error('[repositoryFactory] Error fetching models from PostgreSQL:', err.message);
-        return [];
+        console.error('[repositoryFactory] CRITICAL: Fout bij ophalen modellen uit metadata database:', err.message);
+        // Strikte foutafhandeling: gooi de fout door zodat Cube Core NIET stilzwijgend
+        // een leeg schema compileert en alle actieve modellen in het geheugen wist!
+        throw new Error(`[VAS Repository Error] Metadata database is niet beschikbaar: ${err.message}`);
       }
     }
   }),
@@ -130,8 +136,9 @@ module.exports = {
       const row = res.rows[0];
       return `v${row.version}_${row.version_hash}_${new Date(row.updated_at).getTime()}`;
     } catch (err) {
-      console.error('[schemaVersion] Error reading version tracker:', err.message);
-      return 'fallback_version';
+      console.error('[schemaVersion] CRITICAL: Fout bij lezen schema_version_tracker:', err.message);
+      // Gooi fout door bij database-uitval zodat Cube niet onbedoeld herlaadt naar een fallback
+      throw new Error(`[VAS SchemaVersion Error] Kan schemaversie niet bepalen door metadata-database storing: ${err.message}`);
     }
   },
 

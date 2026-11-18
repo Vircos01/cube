@@ -116,6 +116,9 @@
       const [auditFilterResult, setAuditFilterResult] = useState('');
       const [conflictWarning, setConflictWarning] = useState(null);
       const [includeDeleted, setIncludeDeleted] = useState(false);
+      const [healthData, setHealthData] = useState(null);
+      const [metricsData, setMetricsData] = useState(null);
+      const [metricsLoading, setMetricsLoading] = useState(false);
 
       const monacoRef = useRef(null);
       const editorInstance = useRef(null);
@@ -136,9 +139,25 @@
         try {
           const res = await fetch('/management/v1/health');
           const data = await res.json();
+          setHealthData(data);
           if (data.schemaVersion) setSchemaVersion(data.schemaVersion);
         } catch (e) {
+          setHealthData({ status: 'unhealthy', error: e.message });
           setSchemaVersion('Disconnected');
+        }
+      };
+
+      // Load metrics
+      const fetchMetrics = async () => {
+        setMetricsLoading(true);
+        try {
+          const res = await fetch('/management/v1/metrics');
+          const data = await res.json();
+          setMetricsData(data);
+        } catch (e) {
+          console.error('Failed to load metrics:', e);
+        } finally {
+          setMetricsLoading(false);
         }
       };
 
@@ -1091,6 +1110,7 @@
                     { id: 'git', label: '🌿 Git & Version Control' },
                     { id: 'revisions', label: 'DB Revisions & Rollback' },
                     { id: 'audit', label: '📜 Audit Trail & Logs' },
+                    { id: 'metrics', label: '📊 Metrics & Health' },
                     { id: 'query', label: 'Query & SQL Tester' }
                   ].map(tab => (
                     <button
@@ -1098,6 +1118,7 @@
                       onClick={() => {
                         setActiveTab(tab.id);
                         if (tab.id === 'audit') fetchAuditLogs();
+                        if (tab.id === 'metrics') { fetchMetrics(); fetchHealth(); }
                       }}
                       className={`px-3 py-1.5 rounded-t text-xs font-medium transition-colors ${
                         activeTab === tab.id
@@ -2267,6 +2288,154 @@
                     ) : (
                       <div className="p-8 text-center text-slate-500 text-xs italic">
                         {auditLoading ? 'Audit logs worden geladen...' : 'Geen audit log records gevonden voor de geselecteerde filters.'}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* TAB: METRICS & SYSTEM OBSERVABILITY */}
+              {activeTab === 'metrics' && (
+                <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                  {/* Top Bar */}
+                  <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl flex items-center justify-between">
+                    <div>
+                      <div className="flex items-center space-x-2">
+                        <span className="text-xl">📊</span>
+                        <h2 className="text-base font-bold text-slate-100">Systeem Observability & Real-Time Metrics</h2>
+                      </div>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Gedetailleerde status van de metadata database, connection pool, compiler validaties en latency percentielen (p50, p95, p99).
+                      </p>
+                    </div>
+
+                    <div className="flex items-center space-x-3">
+                      <a
+                        href="/management/v1/metrics?format=prometheus"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono border border-slate-700 flex items-center space-x-1"
+                        title="Prometheus Text Exporter"
+                      >
+                        <span>📈 Prometheus Metrics</span>
+                      </a>
+                      <button
+                        onClick={() => { fetchMetrics(); fetchHealth(); }}
+                        disabled={metricsLoading}
+                        className="text-xs px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-medium shadow flex items-center space-x-1"
+                      >
+                        <span>🔄</span>
+                        <span>{metricsLoading ? 'Meten...' : 'Verversen'}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Top Diagnostic Badges */}
+                  <div className="grid grid-cols-4 gap-4">
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-1">
+                      <span className="text-xs text-slate-400 block font-medium">Metadata Database</span>
+                      <div className="flex items-center space-x-2">
+                        <span className={`w-2.5 h-2.5 rounded-full ${healthData && healthData.database?.connected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`}></span>
+                        <span className="font-bold text-slate-100 text-sm">
+                          {healthData && healthData.database?.connected ? 'Online' : 'Offline'}
+                        </span>
+                        {healthData && healthData.database?.latencyMs !== undefined && (
+                          <span className="text-xs text-slate-400 font-mono">({healthData.database.latencyMs}ms)</span>
+                        )}
+                      </div>
+                      <span className="text-[11px] text-slate-500 block">
+                        Pool: {healthData?.database?.pool?.idleCount || 0} idle / {healthData?.database?.pool?.totalCount || 0} totaal
+                      </span>
+                    </div>
+
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-1">
+                      <span className="text-xs text-slate-400 block font-medium">Schema Version & Modellen</span>
+                      <div className="font-mono font-bold text-indigo-300 text-sm truncate" title={schemaVersion}>
+                        {schemaVersion.split('_')[0] || 'v1'}
+                      </div>
+                      <span className="text-[11px] text-slate-500 block">
+                        {healthData?.models?.activeCount || 0} actieve modellen in runtime
+                      </span>
+                    </div>
+
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-1">
+                      <span className="text-xs text-slate-400 block font-medium">Compiler Validaties</span>
+                      <div className="font-bold text-slate-100 text-sm">
+                        {metricsData?.compiler?.totalValidations || 0} validaties
+                      </div>
+                      <span className="text-[11px] text-slate-500 block">
+                        Gem. duur: {metricsData?.compiler?.avgDurationMs || 0}ms (p95: {metricsData?.compiler?.p95Ms || 0}ms)
+                      </span>
+                    </div>
+
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-1">
+                      <span className="text-xs text-slate-400 block font-medium">Geheugengebruik & Uptime</span>
+                      <div className="font-bold text-slate-100 text-sm font-mono">
+                        {metricsData?.memory?.heapUsedMb || 0} MB heap
+                      </div>
+                      <span className="text-[11px] text-slate-500 block font-mono">
+                        Uptime: {Math.floor((metricsData?.uptimeSeconds || 0) / 60)}m {((metricsData?.uptimeSeconds || 0) % 60)}s
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Endpoints Latency Table */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-lg space-y-2 p-4">
+                    <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                        API Request Latenties & Endpoint Verkeer (SLO Monitor)
+                      </h3>
+                      <span className="text-[11px] text-slate-500">Gemeten over de laatste 100 requests per route</span>
+                    </div>
+
+                    {metricsData && metricsData.endpoints && Object.keys(metricsData.endpoints).length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs font-mono">
+                          <thead>
+                            <tr className="border-b border-slate-800 text-slate-400 font-sans">
+                              <th className="p-2.5">Endpoint & Status</th>
+                              <th className="p-2.5">Aanroepen</th>
+                              <th className="p-2.5">Gemiddeld</th>
+                              <th className="p-2.5">p50 (Mediaan)</th>
+                              <th className="p-2.5">p95</th>
+                              <th className="p-2.5">p99</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {Object.entries(metricsData.endpoints).map(([key, item]) => {
+                              const parts = key.split(' ');
+                              const method = parts[0];
+                              const route = parts.slice(1, -1).join(' ');
+                              const status = parts[parts.length - 1];
+                              const isError = parseInt(status, 10) >= 400;
+
+                              return (
+                                <tr key={key} className="border-b border-slate-800/40 hover:bg-slate-800/30 text-slate-300">
+                                  <td className="p-2.5">
+                                    <span className="text-indigo-400 font-bold mr-2">{method}</span>
+                                    <span className="text-slate-200">{route}</span>
+                                    <span className={`ml-2 text-[10px] px-1.5 py-0.5 rounded font-sans font-semibold ${
+                                      isError ? 'bg-rose-950 text-rose-300 border border-rose-800' : 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                                    }`}>
+                                      {status}
+                                    </span>
+                                  </td>
+                                  <td className="p-2.5 font-bold text-slate-200">{item.requestsCount}</td>
+                                  <td className="p-2.5 text-slate-300">{item.avgDurationMs}ms</td>
+                                  <td className="p-2.5 text-emerald-400">{item.p50Ms}ms</td>
+                                  <td className={`p-2.5 font-semibold ${item.p95Ms > 200 ? 'text-amber-400' : 'text-slate-300'}`}>
+                                    {item.p95Ms}ms
+                                  </td>
+                                  <td className="p-2.5 text-slate-400">{item.p99Ms}ms</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="p-8 text-center text-slate-500 text-xs italic">
+                        {metricsLoading ? 'Metrics worden berekend...' : 'Nog geen HTTP requests geregistreerd sinds startup.'}
                       </div>
                     )}
                   </div>

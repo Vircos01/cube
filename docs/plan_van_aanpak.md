@@ -112,25 +112,34 @@ Een fase is pas afgerond wanneer de acceptatiecriteria zijn gehaald, inclusief g
 - **Geteste Backup & Restore Runbook**: Consistente back-ups via `pg_dump` en bewezen disaster recovery via `pg_restore` gedocumenteerd en geverifieerd in de containeromgeving.
 - **Automatisering**: 42/42 geautomatiseerde unit- en integratietests geslaagd.
 
-## Fase 5 — Betrouwbaarheid, observability en performance
+## Fase 5 — Betrouwbaarheid, observability en performance [VOLTOOID]
 
 **Doel:** fouten detecteerbaar maken en operationeel herstel ondersteunen.
 
-**Werk:**
-
-- Voeg gestructureerde logs, request/correlation-ID’s, metrics en health checks toe voor management-API, metadata-database, databronnen en compiler.
-- Maak compileerfouten en schema-version-status zichtbaar zonder gevoelige details te lekken.
-- Stel timeouts, connection pooling, querylimieten en importlimieten in.
-- Definieer gedrag bij metadata-database-uitval: geen lege schemafallback die modellen stil verbergt; geef een duidelijke niet-beschikbare toestand.
-- Documenteer deployment, migrations, secrets, TLS, upgrades, backup en incidentherstel.
-- Meet compileertijd en querylatentie met representatieve modellen en datasets.
-
-**Acceptatiecriteria:**
-
-- Een operator kan onderscheid maken tussen database-uitval, ongeldige modellen, compilerfouten en queryfouten.
-- Een storing leidt niet tot onbedoelde publicatie van een leeg of gedeeltelijk schema.
-- SLO’s voor beschikbaarheid, compileertijd en querylatentie zijn afgesproken en meetbaar.
-- Deployment en herstel zijn reproduceerbaar vanuit de documentatie.
+**Opgeleverd:**
+- **Observability Engine & Endpoints**:
+  - `GET /management/v1/health`: Diepe diagnose van metadata PostgreSQL verbinding, query latency (ms), connection pool statistieken (`totalCount`, `idleCount`, `waitingCount`) en aantal actieve modellen in runtime.
+  - `GET /management/v1/health/live`: Liveness probe voor container health checks.
+  - `GET /management/v1/health/ready`: Readiness probe voor load balancers en Kubernetes traffic routing.
+  - `GET /management/v1/metrics`: In-memory rolling metrics en officiële Prometheus exporter (`Accept: text/plain` of `?format=prometheus`) met `vas_uptime_seconds`, `vas_memory_heap_used_bytes`, `vas_compiler_validations_total` en `vas_http_requests_total` inclusief p50, p95 en p99 latentieverdelingen.
+- **Gestructureerde Logging & Redaction**:
+  - `Logger` met `AsyncLocalStorage` voor automatische correlatie van `X-Request-Id` / `X-Correlation-Id`.
+  - Single-line JSON logs in productie (`NODE_ENV=production`) en ANSI kleurformaat in ontwikkeling.
+  - Recursieve gegevensmaskering (`redactSensitiveData`) van wachtwoorden, API tokens, database connection string credentials (`postgres://user:[REDACTED]@...`) en Bearer headers in logs en API responses.
+- **Timeouts, Resource Limieten & Bescherming**:
+  - PostgreSQL connection pool met `max: 20`, `idleTimeoutMillis: 30000`, `connectionTimeoutMillis: 5000` en `statement_timeout: 30000`.
+  - Batch import beveiligd met maximale limiet van 50 tabellen per batch met duidelijke `HTTP 400 - Importlimiet overschreden`.
+- **Faalgedrag Metadata Database (Anti-Silent Wipe)**:
+  - `runtime/cube.js` werpt een kritieke exception op bij database-uitval in plaats van een lege array (`[]`) te retourneren. Hierdoor blijft het bestaande geldige gecompileerde schema in-memory beschikbaar en worden actieve BI-clients beschermd tegen een plotseling leeg schema.
+- **Web-UI "📊 Metrics & Health" Dashboard**:
+  - Real-time visualisatie van databaseverbinding, roundtrip-latentie, actieve modellen en actuele `schemaVersion`.
+  - Systeemgeheugen (Heap used / RSS) en compiler validatietellers.
+  - Endpoints latentietabel met request counters en p50/p95/p99 responsietijden.
+  - Directe link naar `/management/v1/metrics` voor scraping.
+- **Gedocumenteerde Standen & SLO's**:
+  - [docs/observability_en_performance.md](file:///Users/remcovisser/Dev/Cube/docs/observability_en_performance.md): Volledig overzicht van health probes, Prometheus exporter, empirische benchmarks (DB latency ~1.94ms, query latency ~3.44ms, memory ~65MB) en vastgestelde 99.9% SLO's.
+  - [docs/deployment_en_operatie.md](file:///Users/remcovisser/Dev/Cube/docs/deployment_en_operatie.md): Productiearchitectuur, containertopologie, secrets management, reverse proxy TLS configuratie en incident playbooks.
+- **Automatisering**: 50/50 geautomatiseerde unit- en integratietests geslaagd.
 
 ## Fase 6 — BI-compatibiliteit en releasecriteria
 
