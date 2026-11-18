@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cube-metadata-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cubedb
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cubedb"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  cube:
+    image: cubejs/cube:latest
+    container_name: cube-core-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "4000:4000"    # Cube API Server & Playground
+      - "4001:4001"    # Web-UI & Management REST API (/admin)
+      - "15432:15432"  # Cube SQL API (Postgres Wire Protocol for Apache Superset)
+    volumes:
+      - ./cube.js:/cube/conf/cube.js
+      - ../packages/cubejs-management-api:/management-api
+
+volumes:
+  pgdata:
