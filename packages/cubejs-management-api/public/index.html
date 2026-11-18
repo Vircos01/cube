@@ -46,9 +46,27 @@
       const [saving, setSaving] = useState(false);
       const [notification, setNotification] = useState(null);
       
-      // Introspect state
+      // Data Source & Playground state
       const [dbTables, setDbTables] = useState([]);
       const [loadingIntrospect, setLoadingIntrospect] = useState(false);
+      const [selectedTableNames, setSelectedTableNames] = useState([]);
+      const [introspectSearch, setIntrospectSearch] = useState('');
+      const [activeSourceMode, setActiveSourceMode] = useState('default'); // 'default' | 'custom'
+      const [customConn, setCustomConn] = useState({
+        host: 'postgres',
+        port: 5432,
+        database: 'cubedb',
+        user: 'postgres',
+        password: 'postgres',
+        schema: 'public',
+        ssl: false
+      });
+      const [connTestResult, setConnTestResult] = useState(null);
+      const [testingConn, setTestingConn] = useState(false);
+      const [autoJoins, setAutoJoins] = useState(true);
+      const [autoMeasures, setAutoMeasures] = useState(true);
+      const [generatingBatch, setGeneratingBatch] = useState(false);
+      const [expandedTables, setExpandedTables] = useState({});
 
       // Query tester state
       const [queryJson, setQueryJson] = useState('{\n  "measures": ["Orders.count", "Orders.total_amount"],\n  "dimensions": ["Orders.status"]\n}');
@@ -226,13 +244,51 @@
         }
       };
 
-      // Introspect DB
-      const loadIntrospect = async () => {
+      // Test custom database connection
+      const handleTestConnection = async () => {
+        setTestingConn(true);
+        setConnTestResult(null);
+        try {
+          const res = await fetch('/management/v1/datasources/test-connection', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify(customConn)
+          });
+          const data = await res.json();
+          setConnTestResult(data);
+          if (data.success) {
+            notify(`✓ Connection successful! (${data.latencyMs}ms)`);
+            if (data.schemas && data.schemas.length > 0 && !data.schemas.includes(customConn.schema)) {
+              setCustomConn(prev => ({ ...prev, schema: data.schemas[0] }));
+            }
+          } else {
+            notify(`Connection failed: ${data.error}`, 'error');
+          }
+        } catch (e) {
+          setConnTestResult({ success: false, error: e.message });
+          notify(`Connection error: ${e.message}`, 'error');
+        } finally {
+          setTestingConn(false);
+        }
+      };
+
+      // Introspect DB (Default or Custom DB)
+      const loadIntrospect = async (mode = activeSourceMode) => {
         setLoadingIntrospect(true);
         try {
-          const res = await fetch('/management/v1/datasources/introspect', { headers: getHeaders() });
+          const payload = mode === 'custom'
+            ? { connection: customConn, schema: customConn.schema }
+            : { schema: 'public' };
+
+          const res = await fetch('/management/v1/datasources/introspect', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify(payload)
+          });
           const data = await res.json();
-          setDbTables(data.tables || []);
+          const tables = data.tables || [];
+          setDbTables(tables);
+          setSelectedTableNames(tables.map(t => `${t.schema}.${t.name}`));
         } catch (e) {
           notify(`Introspection failed: ${e.message}`, 'error');
         } finally {
@@ -240,61 +296,71 @@
         }
       };
 
-      // Generate Cube from introspected table
-      const generateCubeFromTable = async (table) => {
-        const cubeName = table.name.replace(/^(sample_|tbl_)/, '')
-          .split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('');
+      // Batch generate selected tables into VAS
+      const handleBatchGenerate = async () => {
+        const selected = dbTables.filter(t => selectedTableNames.includes(`${t.schema}.${t.name}`));
+        if (selected.length === 0) {
+          notify('Select at least one table to import', 'error');
+          return;
+        }
 
-        const dims = table.columns.map(c => {
-          let type = 'string';
-          if (c.type.includes('int') || c.type.includes('num') || c.type.includes('float') || c.type.includes('double')) type = 'number';
-          else if (c.type.includes('time') || c.type.includes('date')) type = 'time';
-          else if (c.type.includes('bool')) type = 'boolean';
-
-          return {
-            name: c.name,
-            sql: c.name,
-            type,
-            ...(c.isPrimaryKey ? { primary_key: true } : {})
-          };
-        });
-
-        const newCubeDef = {
-          cubes: [
-            {
-              name: cubeName,
-              sql_table: `${table.schema}.${table.name}`,
-              dimensions: dims,
-              measures: [
-                { name: 'count', type: 'count' }
-              ]
-            }
-          ]
-        };
-
-        const newYaml = jsyaml.dump(newCubeDef, { indent: 2, lineWidth: -1 });
-
+        setGeneratingBatch(true);
         try {
-          const res = await fetch('/management/v1/models', {
+          const res = await fetch('/management/v1/datasources/generate-cubes', {
             method: 'POST',
             headers: getHeaders(),
             body: JSON.stringify({
-              name: cubeName,
-              model_type: 'cube',
-              content: newYaml,
-              change_summary: `Auto-generated from database table ${table.name}`
+              tables: selected,
+              options: { autoJoins, autoMeasures }
             })
           });
           const data = await res.json();
           if (res.ok) {
-            notify(`✓ Cube ${cubeName} generated from table ${table.name}!`);
+            notify(`✓ Successfully generated & imported ${data.count} models into VAS!`);
             fetchHealth();
             await fetchModels();
-            selectModel(data.model.id);
+            if (data.imported && data.imported.length > 0) {
+              selectModel(data.imported[0].model.id);
+            }
+            setActiveTab('editor');
+          } else {
+            notify(`Import failed: ${data.error}`, 'error');
+          }
+        } catch (e) {
+          notify(`Import error: ${e.message}`, 'error');
+        } finally {
+          setGeneratingBatch(false);
+        }
+      };
+
+      // Generate single Cube from introspected table
+      const generateCubeFromTable = async (table) => {
+        setGeneratingBatch(true);
+        try {
+          const res = await fetch('/management/v1/datasources/generate-cubes', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({
+              tables: [table],
+              options: { autoJoins, autoMeasures }
+            })
+          });
+          const data = await res.json();
+          if (res.ok && data.imported && data.imported.length > 0) {
+            notify(`✓ Cube ${data.imported[0].cubeName} generated from table ${table.name}!`);
+            fetchHealth();
+            await fetchModels();
+            selectModel(data.imported[0].model.id);
             setActiveTab('editor');
           } else {
             notify(`Failed: ${data.error}`, 'error');
           }
+        } catch (e) {
+          notify(`Error: ${e.message}`, 'error');
+        } finally {
+          setGeneratingBatch(false);
+        }
+      };
         } catch (e) {
           notify(`Error: ${e.message}`, 'error');
         }
@@ -732,11 +798,11 @@
                 <div className="flex space-x-1">
                   {[
                     { id: 'editor', label: 'Visual & YAML Split-View' },
-                    { id: 'git', label: '🌿 Git & Version Control' },
+                    { id: 'introspect', label: '🔌 Data Sources & Playground' },
                     { id: 'security', label: '🔐 Access Control (SSAS)' },
+                    { id: 'git', label: '🌿 Git & Version Control' },
                     { id: 'revisions', label: 'DB Revisions & Rollback' },
-                    { id: 'query', label: 'Query & SQL Tester' },
-                    { id: 'introspect', label: 'Database Introspection' }
+                    { id: 'query', label: 'Query & SQL Tester' }
                   ].map(tab => (
                     <button
                       key={tab.id}
@@ -1634,47 +1700,377 @@
                 </div>
               )}
 
-              {/* TAB 4: DATABASE INTROSPECTION */}
+              {/* TAB: DATA SOURCES & PLAYGROUND */}
               {activeTab === 'introspect' && (
-                <div className="flex-1 overflow-y-auto p-6 space-y-4">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h2 className="text-base font-bold text-slate-200">Database Introspection</h2>
-                      <p className="text-xs text-slate-400">Inspect physical database tables and automatically generate Cubes</p>
+                <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                  {/* Top Header Banner */}
+                  <div className="bg-gradient-to-r from-slate-900 via-indigo-950/40 to-slate-900 border border-slate-800 p-5 rounded-xl flex items-center justify-between">
+                    <div className="flex items-center space-x-3">
+                      <span className="text-2xl">🔌</span>
+                      <div>
+                        <h2 className="text-base font-bold text-slate-100">
+                          Data Sources & Schema Playground
+                        </h2>
+                        <p className="text-xs text-slate-400">
+                          Geef een brondatabase op, inspecteer schema's en tabellen, en neem geselecteerde tabellen automatisch op in VAS als semantische modellen (met dimensies, measures en joins).
+                        </p>
+                      </div>
                     </div>
-                    <button
-                      onClick={loadIntrospect}
-                      className="text-xs px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-medium"
-                    >
-                      {loadingIntrospect ? 'Introspecting...' : 'Re-introspect Database'}
-                    </button>
+
+                    {/* Source Mode Toggle */}
+                    <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800 space-x-1 text-xs">
+                      <button
+                        onClick={() => {
+                          setActiveSourceMode('default');
+                          loadIntrospect('default');
+                        }}
+                        className={`px-3 py-1.5 rounded-md font-medium transition-colors ${
+                          activeSourceMode === 'default'
+                            ? 'bg-indigo-600 text-white shadow'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Default VAS Database
+                      </button>
+                      <button
+                        onClick={() => setActiveSourceMode('custom')}
+                        className={`px-3 py-1.5 rounded-md font-medium transition-colors ${
+                          activeSourceMode === 'custom'
+                            ? 'bg-indigo-600 text-white shadow'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Custom / Externe Database
+                      </button>
+                    </div>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-4">
-                    {dbTables.map(table => (
-                      <div key={`${table.schema}.${table.name}`} className="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-3">
-                        <div className="flex items-center justify-between">
-                          <span className="font-mono font-bold text-slate-200 text-sm">{table.schema}.{table.name}</span>
+                  {/* Custom Database Configurator (if activeSourceMode === 'custom') */}
+                  {activeSourceMode === 'custom' && (
+                    <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                      <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                        <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                          ⚙️ Externe Database Verbinding Instellen
+                        </span>
+                        <div className="flex items-center space-x-2">
                           <button
-                            onClick={() => generateCubeFromTable(table)}
-                            className="text-xs px-2.5 py-1 bg-indigo-950 hover:bg-indigo-800 text-indigo-300 border border-indigo-700 rounded font-medium"
+                            onClick={handleTestConnection}
+                            disabled={testingConn}
+                            className="text-xs px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-indigo-300 border border-slate-700 font-medium"
                           >
-                            + Generate Cube
+                            {testingConn ? 'Verbinding testen...' : '🔌 Test Verbinding'}
+                          </button>
+                          <button
+                            onClick={() => loadIntrospect('custom')}
+                            disabled={loadingIntrospect}
+                            className="text-xs px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-medium"
+                          >
+                            {loadingIntrospect ? 'Ophalen...' : 'Haal Tabellen Op'}
                           </button>
                         </div>
+                      </div>
 
-                        <div className="border-t border-slate-800 pt-2 space-y-1">
-                          {table.columns.map(col => (
-                            <div key={col.name} className="flex items-center justify-between text-xs py-0.5 font-mono text-slate-400">
-                              <span>{col.name}</span>
-                              <span className="text-[11px] text-slate-500">
-                                {col.type} {col.isPrimaryKey ? '🔑 PK' : ''}
-                              </span>
-                            </div>
-                          ))}
+                      {/* Connection Fields Grid */}
+                      <div className="grid grid-cols-4 gap-3 text-xs">
+                        <div>
+                          <label className="text-slate-400 block mb-1">Host / Server</label>
+                          <input
+                            type="text"
+                            value={customConn.host}
+                            onChange={(e) => setCustomConn({ ...customConn, host: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+                            placeholder="e.g. postgres, localhost, db.company.com"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-slate-400 block mb-1">Poort</label>
+                          <input
+                            type="number"
+                            value={customConn.port}
+                            onChange={(e) => setCustomConn({ ...customConn, port: parseInt(e.target.value, 10) || 5432 })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+                            placeholder="5432"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-slate-400 block mb-1">Database Naam</label>
+                          <input
+                            type="text"
+                            value={customConn.database}
+                            onChange={(e) => setCustomConn({ ...customConn, database: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+                            placeholder="cubedb, my_warehouse"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-slate-400 block mb-1">Schema</label>
+                          <input
+                            type="text"
+                            value={customConn.schema}
+                            onChange={(e) => setCustomConn({ ...customConn, schema: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+                            placeholder="public"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="text-slate-400 block mb-1">Gebruikersnaam</label>
+                          <input
+                            type="text"
+                            value={customConn.user}
+                            onChange={(e) => setCustomConn({ ...customConn, user: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+                            placeholder="postgres"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-slate-400 block mb-1">Wachtwoord</label>
+                          <input
+                            type="password"
+                            value={customConn.password}
+                            onChange={(e) => setCustomConn({ ...customConn, password: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+                            placeholder="••••••••"
+                          />
+                        </div>
+                        <div className="flex items-center space-x-2 pt-6">
+                          <input
+                            type="checkbox"
+                            id="ssl-check"
+                            checked={customConn.ssl}
+                            onChange={(e) => setCustomConn({ ...customConn, ssl: e.target.checked })}
+                            className="rounded bg-slate-950 border-slate-700 text-indigo-600 focus:ring-0"
+                          />
+                          <label htmlFor="ssl-check" className="text-slate-300 cursor-pointer">SSL inschakelen</label>
                         </div>
                       </div>
-                    ))}
+
+                      {/* Connection Test Banner if available */}
+                      {connTestResult && (
+                        <div className={`p-3 rounded-lg border text-xs flex items-center justify-between ${
+                          connTestResult.success
+                            ? 'bg-emerald-950/40 border-emerald-800 text-emerald-200'
+                            : 'bg-rose-950/40 border-rose-800 text-rose-200'
+                        }`}>
+                          <div className="flex items-center space-x-2">
+                            <span>{connTestResult.success ? '✓' : '✗'}</span>
+                            <span>{connTestResult.success ? `Verbonden met ${connTestResult.version} (${connTestResult.latencyMs}ms)` : `Verbinding mislukt: ${connTestResult.error}`}</span>
+                          </div>
+                          {connTestResult.schemas && (
+                            <div className="text-[11px] text-slate-400">
+                              Beschikbare schema's: <span className="font-mono text-indigo-300">{connTestResult.schemas.join(', ')}</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Playground Toolbar (Search, Filter, Options & Batch Generate Button) */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
+                    <div className="flex items-center space-x-3">
+                      {/* Search box */}
+                      <div className="relative">
+                        <input
+                          type="text"
+                          value={introspectSearch}
+                          onChange={(e) => setIntrospectSearch(e.target.value)}
+                          placeholder="Filter tabellen (bijv. orders, users)..."
+                          className="w-64 bg-slate-950 border border-slate-800 rounded px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                        />
+                      </div>
+
+                      {/* Select All toggle */}
+                      <button
+                        onClick={() => {
+                          const allKeys = dbTables.map(t => `${t.schema}.${t.name}`);
+                          if (selectedTableNames.length === dbTables.length) {
+                            setSelectedTableNames([]);
+                          } else {
+                            setSelectedTableNames(allKeys);
+                          }
+                        }}
+                        className="text-xs px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium"
+                      >
+                        {selectedTableNames.length === dbTables.length ? 'Deselecteer alles' : `Selecteer alles (${dbTables.length})`}
+                      </button>
+
+                      <div className="h-6 border-r border-slate-800"></div>
+
+                      {/* Generation options checkboxes */}
+                      <label className="flex items-center space-x-1.5 text-xs text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={autoJoins}
+                          onChange={(e) => setAutoJoins(e.target.checked)}
+                          className="rounded bg-slate-950 border-slate-700 text-indigo-600"
+                        />
+                        <span>Auto Joins (FK)</span>
+                      </label>
+
+                      <label className="flex items-center space-x-1.5 text-xs text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={autoMeasures}
+                          onChange={(e) => setAutoMeasures(e.target.checked)}
+                          className="rounded bg-slate-950 border-slate-700 text-indigo-600"
+                        />
+                        <span>Auto Measures (Sum/Avg)</span>
+                      </label>
+                    </div>
+
+                    {/* Batch Generate CTA Button */}
+                    <div className="flex items-center space-x-2">
+                      <button
+                        onClick={loadIntrospect}
+                        disabled={loadingIntrospect}
+                        className="text-xs px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium"
+                      >
+                        {loadingIntrospect ? 'Verversen...' : '🔄 Verversen'}
+                      </button>
+
+                      <button
+                        onClick={handleBatchGenerate}
+                        disabled={generatingBatch || selectedTableNames.length === 0}
+                        className="text-xs px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold shadow disabled:opacity-50 flex items-center space-x-1.5"
+                      >
+                        <span>🚀</span>
+                        <span>
+                          {generatingBatch ? 'Bezig met importeren...' : `Genereer & Neem ${selectedTableNames.length} Tabellen op in VAS`}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Tables List / Cards */}
+                  <div className="space-y-3">
+                    {dbTables
+                      .filter(t => !introspectSearch || t.name.toLowerCase().includes(introspectSearch.toLowerCase()))
+                      .map(table => {
+                        const tableKey = `${table.schema}.${table.name}`;
+                        const isSelected = selectedTableNames.includes(tableKey);
+                        const isExpanded = !!expandedTables[tableKey];
+                        const cubeName = table.name.replace(/^(sample_|tbl_|dim_|fact_)/i, '')
+                          .split(/[_-]+/).map(p => p.charAt(0).toUpperCase() + p.slice(1)).join('');
+                        const alreadyExists = models.some(m => m.name.toLowerCase() === cubeName.toLowerCase());
+                        const pkCols = table.columns.filter(c => c.isPrimaryKey).map(c => c.name);
+                        const fks = table.foreignKeys || [];
+
+                        return (
+                          <div
+                            key={tableKey}
+                            className={`bg-slate-900 border rounded-xl overflow-hidden transition-all ${
+                              isSelected ? 'border-indigo-600/70 bg-indigo-950/10' : 'border-slate-800'
+                            }`}
+                          >
+                            {/* Card Header Row */}
+                            <div className="p-4 flex items-center justify-between">
+                              <div className="flex items-center space-x-3">
+                                <input
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      setSelectedTableNames([...selectedTableNames, tableKey]);
+                                    } else {
+                                      setSelectedTableNames(selectedTableNames.filter(k => k !== tableKey));
+                                    }
+                                  }}
+                                  className="w-4 h-4 rounded bg-slate-950 border-slate-700 text-indigo-600 focus:ring-0 cursor-pointer"
+                                />
+                                <div>
+                                  <div className="flex items-center space-x-2">
+                                    <span className="font-mono font-bold text-slate-100 text-sm">{table.schema}.{table.name}</span>
+                                    {alreadyExists ? (
+                                      <span className="text-[10px] bg-emerald-950 text-emerald-300 border border-emerald-800 px-2 py-0.5 rounded-full font-mono font-semibold">
+                                        ✓ in VAS ({cubeName})
+                                      </span>
+                                    ) : (
+                                      <span className="text-[10px] bg-indigo-950 text-indigo-300 border border-indigo-800 px-2 py-0.5 rounded-full font-mono font-semibold">
+                                        + Nieuwe Tabel
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center space-x-2 text-[11px] text-slate-400 mt-1">
+                                    <span>{table.columns.length} kolommen</span>
+                                    {pkCols.length > 0 && (
+                                      <>
+                                        <span>•</span>
+                                        <span className="text-amber-400 font-mono">🔑 PK: {pkCols.join(', ')}</span>
+                                      </>
+                                    )}
+                                    {fks.length > 0 && (
+                                      <>
+                                        <span>•</span>
+                                        <span className="text-indigo-400 font-mono">🔗 {fks.length} Foreign Key(s)</span>
+                                      </>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center space-x-2">
+                                <button
+                                  onClick={() => setExpandedTables({ ...expandedTables, [tableKey]: !isExpanded })}
+                                  className="text-xs px-2.5 py-1 text-slate-400 hover:text-slate-200 bg-slate-950 rounded border border-slate-800"
+                                >
+                                  {isExpanded ? 'Verberg Kolommen ▲' : 'Bekijk Kolommen ▼'}
+                                </button>
+                                <button
+                                  onClick={() => generateCubeFromTable(table)}
+                                  className="text-xs px-3 py-1 bg-indigo-950 hover:bg-indigo-900 text-indigo-300 border border-indigo-700/60 rounded font-medium transition-colors"
+                                >
+                                  {alreadyExists ? 'Hergenereer Cube' : '+ Genereer Cube'}
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Expandable Columns & Foreign Keys Details */}
+                            {isExpanded && (
+                              <div className="border-t border-slate-800/80 bg-slate-950/70 p-4 space-y-3">
+                                {fks.length > 0 && (
+                                  <div>
+                                    <span className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold block mb-1">
+                                      Gedetecteerde Relaties (Foreign Keys):
+                                    </span>
+                                    <div className="space-y-1">
+                                      {fks.map((fk, fkIdx) => (
+                                        <div key={fkIdx} className="text-xs font-mono text-indigo-300 bg-indigo-950/40 border border-indigo-900/40 p-1.5 rounded flex items-center space-x-2">
+                                          <span>🔗</span>
+                                          <span><strong>{table.name}.{fk.column}</strong> ➔ <strong>{fk.foreignTable}.{fk.foreignColumn}</strong> (Many-to-One relatie)</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                <div>
+                                  <span className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold block mb-1">
+                                    Kolommen & Datatypes:
+                                  </span>
+                                  <div className="grid grid-cols-3 gap-2">
+                                    {table.columns.map(col => (
+                                      <div key={col.name} className="bg-slate-900/90 border border-slate-800/80 p-2 rounded text-xs flex items-center justify-between font-mono">
+                                        <div className="truncate">
+                                          <span className="text-slate-200">{col.name}</span>
+                                          {col.isPrimaryKey && <span className="text-amber-400 ml-1">🔑</span>}
+                                        </div>
+                                        <span className="text-slate-500 text-[10px]">{col.type}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+
+                    {dbTables.length === 0 && !loadingIntrospect && (
+                      <div className="p-8 text-center text-slate-500 text-xs italic bg-slate-900 rounded-xl border border-slate-800">
+                        Geen tabellen gevonden in het huidige schema. Klik op "Haal Tabellen Op" of controleer de verbindingsgegevens.
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

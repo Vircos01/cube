@@ -69,6 +69,13 @@ export interface ValidationFailure {
 
 export type ValidationResult = ValidationSuccess | ValidationFailure;
 
+export interface TableForeignKey {
+  column: string;
+  foreignSchema: string;
+  foreignTable: string;
+  foreignColumn: string;
+}
+
 export interface IntrospectColumn {
   name: string;
   type: string;
@@ -80,10 +87,24 @@ export interface IntrospectTable {
   schema: string;
   name: string;
   columns: IntrospectColumn[];
+  foreignKeys?: TableForeignKey[];
+}
+
+export interface DatabaseConnectionConfig {
+  type?: string;
+  host?: string;
+  port?: number;
+  database?: string;
+  user?: string;
+  password?: string;
+  schema?: string;
+  ssl?: boolean;
 }
 
 export interface IntrospectResult {
   tables: IntrospectTable[];
+  schemas?: string[];
+  databaseVersion?: string;
 }
 
 export interface FileContent {

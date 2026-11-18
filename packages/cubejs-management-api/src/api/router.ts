@@ -12,7 +12,12 @@ import {
   getActiveSchemaFiles,
 } from '../repository/modelStore';
 import { validateSchemaContent } from '../compiler/validator';
-import { introspectPostgresDatabase } from './introspect';
+import {
+  introspectPostgresDatabase,
+  testDatabaseConnection,
+  generateCubeDef,
+  toCubeName
+} from './introspect';
 import { createAuthMiddleware, AuthenticatedRequest } from './auth';
 import { importModelsFromDirectory, exportModelsToDirectory } from '../repository/fileMigrator';
 import { GitService } from '../git/gitService';
@@ -209,12 +214,108 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
     }
   });
 
-  // GET /datasources/introspect - Inspect database tables and columns
-  router.get('/datasources/introspect', async (req: AuthenticatedRequest, res: Response) => {
+  // POST /datasources/test-connection - Test source database connection
+  router.post('/datasources/test-connection', async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const schema = (req.query.schema as string) || 'public';
-      const result = await introspectPostgresDatabase(pool, schema);
-      res.json(result);
+      const config = req.body || {};
+      const result = await testDatabaseConnection(config);
+      if (result.success) {
+        res.json(result);
+      } else {
+        res.status(400).json(result);
+      }
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // GET & POST /datasources/introspect - Inspect database tables, columns & foreign keys
+  const handleIntrospect = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const schema = (req.query.schema as string) || (req.body && req.body.schema) || 'public';
+      const connection = req.body && req.body.connection;
+
+      if (connection && (connection.host || connection.database)) {
+        // Use custom connection
+        const client = new Client({
+          host: connection.host || process.env.CUBEJS_DB_HOST || 'localhost',
+          port: connection.port || parseInt(process.env.CUBEJS_DB_PORT || '5432', 10),
+          user: connection.user || process.env.CUBEJS_DB_USER || 'postgres',
+          password: connection.password || process.env.CUBEJS_DB_PASS || 'postgres',
+          database: connection.database || process.env.CUBEJS_DB_NAME || 'cubedb',
+          ssl: connection.ssl ? { rejectUnauthorized: false } : false,
+          connectionTimeoutMillis: 5000
+        });
+
+        try {
+          await client.connect();
+          const result = await introspectPostgresDatabase(client, schema);
+          res.json(result);
+        } finally {
+          await client.end().catch(() => {});
+        }
+      } else {
+        // Use default pool
+        const result = await introspectPostgresDatabase(pool, schema);
+        res.json(result);
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  };
+
+  router.get('/datasources/introspect', handleIntrospect);
+  router.post('/datasources/introspect', handleIntrospect);
+
+  // POST /datasources/generate-cubes - Batch generate cubes from selected tables with FK joins and measures
+  router.post('/datasources/generate-cubes', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { tables, options = {} } = req.body;
+      if (!tables || !Array.isArray(tables) || tables.length === 0) {
+        res.status(400).json({ error: 'Array of "tables" is required' });
+        return;
+      }
+
+      const actor = req.user?.actor || 'VAS Data Source Explorer';
+      const results: any[] = [];
+
+      for (const table of tables) {
+        const gen = generateCubeDef(table, tables, options);
+        // Check if model already exists
+        const existing = await pool.query('SELECT id FROM semantic_models WHERE name = $1', [gen.cubeName]);
+
+        let modelRecord;
+        if (existing.rows.length > 0) {
+          modelRecord = await updateModel(pool, existing.rows[0].id, {
+            content: gen.yaml,
+            change_summary: `Imported/Re-generated from database table ${table.schema}.${table.name}`,
+            actor
+          });
+        } else {
+          modelRecord = await createModel(pool, {
+            name: gen.cubeName,
+            file_name: gen.fileName,
+            model_type: 'cube',
+            content: gen.yaml,
+            description: `Generated from table ${table.schema}.${table.name}`,
+            change_summary: `Initial import from table ${table.schema}.${table.name}`,
+            actor
+          });
+        }
+        results.push({
+          model: modelRecord,
+          cubeName: gen.cubeName,
+          fileName: gen.fileName,
+          table: `${table.schema}.${table.name}`,
+          isUpdate: existing.rows.length > 0
+        });
+      }
+
+      res.json({
+        success: true,
+        count: results.length,
+        imported: results
+      });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
