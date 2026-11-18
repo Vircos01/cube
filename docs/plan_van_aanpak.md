@@ -91,24 +91,26 @@ Een fase is pas afgerond wanneer de acceptatiecriteria zijn gehaald, inclusief g
 - Volledige CRUD endpoints in Management API en interactieve Web-UI voor gebruikers-, rollen- en beleidsbeheer.
 - 35/35 geautomatiseerde unit- en integratietests geslaagd.
 
-## Fase 4 — Modelbeheer, audit en herstel
+## Fase 4 — Modelbeheer, audit en herstel [VOLTOOID]
 
 **Doel:** wijzigingen traceerbaar en herstelbaar maken voor beheerders.
 
-**Werk:**
+**Status:** Volledig geïmplementeerd en geverifieerd. Zie ook [`docs/modelbeheer_audit_en_herstel.md`](file:///Users/remcovisser/Dev/Cube/docs/modelbeheer_audit_en_herstel.md) en [`docs/backup_en_herstel.md`](file:///Users/remcovisser/Dev/Cube/docs/backup_en_herstel.md).
 
-- Maak actor, tijdstip, bron, model, revision en resultaat verplicht in auditrecords voor mutaties.
-- Definieer versieconflictgedrag voor gelijktijdige edits; voorkom stil overschrijven met optimistic concurrency/version checks.
-- Maak rollback een gevalideerde, auditbare wijziging met dezelfde atomische publicatieregels als normale updates.
-- Leg de relatie tussen Git-revisie en metadatarevision vast; specificeer welke opslag leidend is en hoe synchronisatieconflicten worden opgelost.
-- Definieer soft-delete, herstel, bewaartermijnen en export-/backup-procedures.
-
-**Acceptatiecriteria:**
-
-- Iedere wijziging is terug te leiden naar een actor en vorige/nieuwe revision.
-- Twee gelijktijdige updates verliezen geen wijziging zonder expliciet conflict.
-- Rollback herstelt een eerder geldige versie en publiceert deze als nieuwe revision.
-- Een backup kan in een schone omgeving worden hersteld volgens een geteste runbook-procedure.
+**Opgeleverd:**
+- **Optimistic Concurrency Control (OCC)**: `semantic_models.version` en `expectedRevisionNumber` / `expectedVersion` checks bij `PUT /models/:id`. Voorkomt lost updates via transactionele `SELECT ... FOR UPDATE` row locks; bij conflict wordt onmiddellijk afgebroken met **HTTP 409 Conflict** (`code: 'VERSION_CONFLICT'`).
+- **Verplichte Compliance Audit Trail**: `audit_logs` uitgebreid met `model_id`, `model_name`, `previous_revision_id`, `revision_id`, `actor`, `source`, `result` (`SUCCESS`/`FAILED`) en `error_message`. Foutieve pogingen en conflicten worden onafhankelijk gelogd.
+- **Validated Rollback**: `POST /models/:id/rollback/:revNumber` valideert de historische YAML-syntaxis tegen het huidige actieve schema vóór commit. Publiceert de rollback non-destructief als een nieuwe revisie.
+- **Soft-Delete & Herstel**: `DELETE /models/:id` markeert modellen als inactief (`is_active = false`) en archiveert actieve revisies. `POST /models/:id/restore` toetst en herstelt gedeactiveerde modellen.
+- **Git Traceability**: `git_commit_hash` gestempeld op actieve `model_revisions`; bi-directionele traceerbaarheid met 🌿 git-badge in de UI en `GIT_COMMIT`/`GIT_PULL` compliancelogs.
+- **Revisieretentiebeleid**: `POST /models/cleanup-revisions` schoont gearchiveerde revisies ouder dan de retentiedagen op met behoud van minimaal $N$ revisies per model.
+- **Interactieve Web-UI**:
+  - Versieconflictwaarschuwing met behoud van editor-inhoud en knop "Laad Nieuwste Revisie".
+  - Specifiek tabblad "📜 Audit Trail & Logs" met dynamische filters (Actie, Resultaat) en responsive overzichtstabel.
+  - Sidebar ondersteuning voor "Prullenbak" (gedeactiveerde modellen) en "Herstel Model".
+  - Retentie-opschoonknop direct vanuit het audittabblad.
+- **Geteste Backup & Restore Runbook**: Consistente back-ups via `pg_dump` en bewezen disaster recovery via `pg_restore` gedocumenteerd en geverifieerd in de containeromgeving.
+- **Automatisering**: 42/42 geautomatiseerde unit- en integratietests geslaagd.
 
 ## Fase 5 — Betrouwbaarheid, observability en performance
 

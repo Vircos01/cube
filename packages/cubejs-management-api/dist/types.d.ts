@@ -1,5 +1,15 @@
 export type ModelType = 'cube' | 'view';
 export type RevisionStatus = 'active' | 'draft' | 'archived';
+export declare class VersionConflictError extends Error {
+    modelId: string;
+    expectedRevision: number | string;
+    currentRevision: number | string;
+    currentChangeSummary?: string | undefined;
+    currentUpdatedBy?: string | undefined;
+    modelName?: string | undefined;
+    currentRevisionId?: string | undefined;
+    constructor(modelId: string, expectedRevision: number | string, currentRevision: number | string, currentChangeSummary?: string | undefined, currentUpdatedBy?: string | undefined, modelName?: string | undefined, currentRevisionId?: string | undefined);
+}
 export interface SemanticModel {
     id: string;
     name: string;
@@ -7,6 +17,7 @@ export interface SemanticModel {
     file_name: string;
     description?: string | null;
     is_active: boolean;
+    version: number;
     created_at: Date | string;
     updated_at: Date | string;
 }
@@ -18,6 +29,7 @@ export interface ModelRevision {
     content_format: 'yaml' | 'json';
     parsed_json?: any;
     change_summary?: string | null;
+    git_commit_hash?: string | null;
     status: RevisionStatus;
     created_by: string;
     created_at: Date | string;
@@ -32,10 +44,15 @@ export interface SemanticModelDetail extends SemanticModel {
 export interface AuditLogEntry {
     id: number | string;
     action: string;
+    model_id?: string | null;
     model_name?: string | null;
+    previous_revision_id?: string | null;
     revision_id?: string | null;
     details?: Record<string, any> | null;
-    actor?: string | null;
+    actor: string;
+    source: string;
+    result: 'SUCCESS' | 'FAILED';
+    error_message?: string | null;
     ip_address?: string | null;
     created_at: Date | string;
 }

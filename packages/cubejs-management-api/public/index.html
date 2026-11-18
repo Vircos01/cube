@@ -109,6 +109,14 @@
         cityClaim: 'Utrecht',
       });
 
+      // Audit & Concurrency state
+      const [auditLogs, setAuditLogs] = useState([]);
+      const [auditLoading, setAuditLoading] = useState(false);
+      const [auditFilterAction, setAuditFilterAction] = useState('');
+      const [auditFilterResult, setAuditFilterResult] = useState('');
+      const [conflictWarning, setConflictWarning] = useState(null);
+      const [includeDeleted, setIncludeDeleted] = useState(false);
+
       const monacoRef = useRef(null);
       const editorInstance = useRef(null);
 
@@ -135,9 +143,10 @@
       };
 
       // Load models from API
-      const fetchModels = async () => {
+      const fetchModels = async (incDeleted = includeDeleted) => {
         try {
-          const res = await fetch('/management/v1/models', { headers: getHeaders() });
+          const url = `/management/v1/models${incDeleted ? '?includeDeleted=true' : ''}`;
+          const res = await fetch(url, { headers: getHeaders() });
           if (res.status === 401) {
             notify('Invalid API Secret / Unauthorized', 'error');
             return;
@@ -214,53 +223,153 @@
         }
       };
 
-      // Save Model and Hot-Reload
+      // Save Model and Hot-Reload with Optimistic Concurrency Control
       const handleSave = async () => {
         if (!selectedModel) return;
         setSaving(true);
+        setConflictWarning(null);
         try {
           const res = await fetch(`/management/v1/models/${selectedModel.id}`, {
             method: 'PUT',
             headers: getHeaders(),
             body: JSON.stringify({
               content: yamlContent,
-              change_summary: `Updated via Web-UI at ${new Date().toLocaleTimeString()}`
+              change_summary: `Updated via Web-UI at ${new Date().toLocaleTimeString()}`,
+              expectedRevisionNumber: selectedModel.active_revision ? selectedModel.active_revision.revision_number : undefined,
+              source: 'web_ui',
             })
           });
           const data = await res.json();
           if (res.ok) {
-            notify('✓ Model saved & VAS schema hot-reloaded successfully!');
+            notify('✓ Model opgeslagen & VAS schema atomair geüpdatet!');
             fetchHealth();
             fetchModels();
             selectModel(selectedModel.id);
+          } else if (res.status === 409) {
+            setConflictWarning(data);
+            notify(`⚠️ Versieconflict: ${data.message}`, 'error');
           } else {
-            notify(`Save failed: ${data.error || JSON.stringify(data.validation?.errors)}`, 'error');
+            const valDetails = data.validationErrors ? ': ' + data.validationErrors.map(e => e.message).join('; ') : '';
+            notify(`Opslaan mislukt: ${data.error || data.message || ''}${valDetails}`, 'error');
           }
         } catch (e) {
-          notify(`Network error: ${e.message}`, 'error');
+          notify(`Netwerkfout: ${e.message}`, 'error');
         } finally {
           setSaving(false);
         }
       };
 
-      // Rollback to specific revision
+      // Validated atomic rollback to specific revision
       const handleRollback = async (revNumber) => {
-        if (!confirm(`Are you sure you want to rollback to revision #${revNumber}?`)) return;
+        if (!confirm(`Weet je zeker dat je wilt terugrollen naar revisie #${revNumber}? Deze revisie wordt gevalideerd en als nieuwe actieve revisie gepubliceerd.`)) return;
         try {
           const res = await fetch(`/management/v1/models/${selectedModel.id}/rollback/${revNumber}`, {
             method: 'POST',
             headers: getHeaders(),
+            body: JSON.stringify({ source: 'web_ui' })
           });
+          const data = await res.json();
           if (res.ok) {
-            notify(`✓ Rolled back to revision #${revNumber} and reloaded schema!`);
+            notify(`✓ Succesvol teruggerold naar revisie #${revNumber}!`);
             fetchHealth();
+            fetchModels();
             selectModel(selectedModel.id);
           } else {
-            const err = await res.json();
-            notify(`Rollback error: ${err.error}`, 'error');
+            const valDetails = data.validationErrors ? ': ' + data.validationErrors.map(e => e.message).join('; ') : '';
+            notify(`Rollback mislukt: ${data.error || data.message}${valDetails}`, 'error');
           }
         } catch (e) {
-          notify(`Error: ${e.message}`, 'error');
+          notify(`Fout: ${e.message}`, 'error');
+        }
+      };
+
+      // Soft-delete model
+      const handleDeleteModel = async () => {
+        if (!selectedModel) return;
+        if (!confirm(`Weet je zeker dat je model '${selectedModel.name}' wilt deactiveren (soft-delete)? Dit model kan later altijd hersteld worden via de audit trail.`)) return;
+        try {
+          const res = await fetch(`/management/v1/models/${selectedModel.id}`, {
+            method: 'DELETE',
+            headers: getHeaders(),
+            body: JSON.stringify({ actor: 'web_ui', source: 'web_ui' })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            notify(`✓ Model '${selectedModel.name}' gedeactiveerd.`);
+            fetchHealth();
+            fetchModels();
+            setSelectedModel(null);
+          } else {
+            notify(`Fout bij verwijderen: ${data.error}`, 'error');
+          }
+        } catch (e) {
+          notify(`Fout: ${e.message}`, 'error');
+        }
+      };
+
+      // Restore soft-deleted model
+      const handleRestoreModel = async (id, name) => {
+        try {
+          const res = await fetch(`/management/v1/models/${id}/restore`, {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({ actor: 'web_ui', source: 'web_ui' })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            notify(`✓ Model '${name || ''}' succesvol hersteld en schema gehercompileerd!`);
+            fetchHealth();
+            fetchModels();
+            selectModel(id);
+          } else {
+            const valDetails = data.validationErrors ? ': ' + data.validationErrors.map(e => e.message).join('; ') : '';
+            notify(`Herstel mislukt: ${data.error || data.message}${valDetails}`, 'error');
+          }
+        } catch (e) {
+          notify(`Fout bij herstel: ${e.message}`, 'error');
+        }
+      };
+
+      // Cleanup archived revisions per retention policy
+      const handleCleanupRevisions = async () => {
+        if (!confirm('Revisies opschonen: Verwijder gearchiveerde revisies ouder dan 90 dagen (met behoud van minimaal 5 revisies per model)?')) return;
+        try {
+          const res = await fetch('/management/v1/models/cleanup-revisions', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({ retentionDays: 90, keepMinRevisions: 5, actor: 'web_ui', source: 'web_ui' })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            notify(`✓ ${data.deletedCount} oude revisie(s) opgeschoond conform retentiebeleid.`);
+            fetchAuditLogs();
+            if (selectedModel) selectModel(selectedModel.id);
+          } else {
+            notify(`Opschonen mislukt: ${data.error}`, 'error');
+          }
+        } catch (e) {
+          notify(`Fout: ${e.message}`, 'error');
+        }
+      };
+
+      // Fetch audit logs with filtering
+      const fetchAuditLogs = async (actionFilter, resultFilter) => {
+        setAuditLoading(true);
+        try {
+          const act = actionFilter !== undefined ? actionFilter : auditFilterAction;
+          const res = resultFilter !== undefined ? resultFilter : auditFilterResult;
+          let url = '/management/v1/audit-logs?limit=100';
+          if (act) url += `&action=${encodeURIComponent(act)}`;
+          if (res) url += `&result=${encodeURIComponent(res)}`;
+          const response = await fetch(url, { headers: getHeaders() });
+          const data = await response.json();
+          if (data && data.auditLogs) {
+            setAuditLogs(data.auditLogs);
+          }
+        } catch (e) {
+          console.error('Failed to load audit logs:', e);
+        } finally {
+          setAuditLoading(false);
         }
       };
 
@@ -907,7 +1016,21 @@
 
               {/* Models List */}
               <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                <div className="text-[11px] font-semibold text-slate-500 uppercase px-2 pt-1 pb-1">Cubes & Views</div>
+                <div className="flex items-center justify-between px-2 pt-1 pb-1">
+                  <span className="text-[11px] font-semibold text-slate-500 uppercase">Cubes & Views</span>
+                  <label className="flex items-center space-x-1 text-[10px] text-slate-500 cursor-pointer" title="Toon ook gedeactiveerde (soft-deleted) modellen">
+                    <input
+                      type="checkbox"
+                      checked={includeDeleted}
+                      onChange={(e) => {
+                        setIncludeDeleted(e.target.checked);
+                        fetchModels(e.target.checked);
+                      }}
+                      className="rounded bg-slate-950 border-slate-700 text-indigo-600 w-3 h-3"
+                    />
+                    <span>Prullenbak</span>
+                  </label>
+                </div>
                 {models.map(m => (
                   <button
                     key={m.id}
@@ -916,14 +1039,14 @@
                       selectedModel && selectedModel.id === m.id
                         ? 'bg-indigo-900/40 text-indigo-200 border border-indigo-700/50'
                         : 'text-slate-300 hover:bg-slate-800/60'
-                    }`}
+                    } ${m.is_active === false ? 'opacity-50 line-through' : ''}`}
                   >
                     <div className="flex items-center space-x-2 truncate">
-                      <span className={`w-2 h-2 rounded-full ${m.model_type === 'view' ? 'bg-purple-400' : 'bg-indigo-400'}`}></span>
+                      <span className={`w-2 h-2 rounded-full ${m.is_active === false ? 'bg-rose-500' : m.model_type === 'view' ? 'bg-purple-400' : 'bg-indigo-400'}`}></span>
                       <span className="font-medium truncate">{m.name}</span>
                     </div>
                     <span className="text-[10px] text-slate-500 font-mono">
-                      r{m.active_revision ? m.active_revision.revision_number : 1}
+                      {m.is_active === false ? '(verwijderd)' : `r${m.active_revision ? m.active_revision.revision_number : 1}`}
                     </span>
                   </button>
                 ))}
@@ -967,11 +1090,15 @@
                     { id: 'security', label: '🔐 Access Control (SSAS)' },
                     { id: 'git', label: '🌿 Git & Version Control' },
                     { id: 'revisions', label: 'DB Revisions & Rollback' },
+                    { id: 'audit', label: '📜 Audit Trail & Logs' },
                     { id: 'query', label: 'Query & SQL Tester' }
                   ].map(tab => (
                     <button
                       key={tab.id}
-                      onClick={() => setActiveTab(tab.id)}
+                      onClick={() => {
+                        setActiveTab(tab.id);
+                        if (tab.id === 'audit') fetchAuditLogs();
+                      }}
                       className={`px-3 py-1.5 rounded-t text-xs font-medium transition-colors ${
                         activeTab === tab.id
                           ? 'bg-slate-800 text-indigo-300 border-b-2 border-indigo-500'
@@ -1004,11 +1131,31 @@
                       Validate
                     </button>
 
+                    {selectedModel && selectedModel.is_active !== false && (
+                      <button
+                        onClick={handleDeleteModel}
+                        className="text-xs px-2.5 py-1 rounded bg-slate-800 hover:bg-rose-950 hover:text-rose-300 text-slate-400 font-medium transition-colors"
+                        title="Deactiveer model (soft-delete)"
+                      >
+                        🗑️ Deactiveren
+                      </button>
+                    )}
+
+                    {selectedModel && selectedModel.is_active === false && (
+                      <button
+                        onClick={() => handleRestoreModel(selectedModel.id, selectedModel.name)}
+                        className="text-xs px-3 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-white font-medium shadow"
+                        title="Herstel gedeactiveerd model"
+                      >
+                        ♻️ Herstel Model
+                      </button>
+                    )}
+
                     <button
                       onClick={handleSave}
-                      disabled={saving || (validationResult && !validationResult.valid)}
+                      disabled={saving || (validationResult && !validationResult.valid) || (selectedModel && selectedModel.is_active === false)}
                       className={`text-xs px-3.5 py-1 rounded font-semibold text-white shadow flex items-center space-x-1.5 ${
-                        saving || (validationResult && !validationResult.valid)
+                        saving || (validationResult && !validationResult.valid) || (selectedModel && selectedModel.is_active === false)
                           ? 'bg-slate-700 cursor-not-allowed opacity-60'
                           : 'bg-indigo-600 hover:bg-indigo-500'
                       }`}
@@ -1021,7 +1168,37 @@
 
               {/* TAB 1: VISUAL & YAML SPLIT-VIEW */}
               {activeTab === 'editor' && (
-                <div className="flex-1 flex overflow-hidden">
+                <div className="flex-1 flex flex-col overflow-hidden">
+                  {/* Conflict Warning Banner if optimistic concurrency detects a mismatch */}
+                  {conflictWarning && (
+                    <div className="bg-amber-950/80 border-b border-amber-600/80 text-amber-200 p-3 text-xs flex items-center justify-between shrink-0 shadow-lg">
+                      <div className="flex items-center space-x-2.5">
+                        <span className="text-base">⚠️</span>
+                        <div>
+                          <strong>Versieconflict gedetecteerd:</strong> Dit model is tussentijds gewijzigd (huidige actieve revisie is #{conflictWarning.currentRevision}{conflictWarning.currentUpdatedBy ? ` door ${conflictWarning.currentUpdatedBy}` : ''}). Jouw lokale wijzigingen zijn bewaard in de editor en niet verloren gegaan.
+                        </div>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <button
+                          onClick={() => {
+                            setConflictWarning(null);
+                            selectModel(selectedModel.id);
+                          }}
+                          className="px-3 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded font-semibold text-xs shadow"
+                        >
+                          Laad Nieuwste Revisie
+                        </button>
+                        <button
+                          onClick={() => setConflictWarning(null)}
+                          className="px-2 py-1 text-slate-400 hover:text-slate-200 text-xs"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex-1 flex overflow-hidden">
                   {/* Left Half: Visual Form Builder */}
                   <div className="w-1/2 border-r border-slate-800 overflow-y-auto p-4 space-y-6">
                     {parsedForm && parsedForm.cubes && parsedForm.cubes.map((cube, cIdx) => (
@@ -1286,7 +1463,8 @@
                     )}
                   </div>
                 </div>
-              )}
+              </div>
+            )}
 
               {/* TAB: GIT & VERSION CONTROL */}
               {activeTab === 'git' && (
@@ -1878,11 +2056,6 @@
                   )}
                 </div>
               )}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
 
               {/* TAB 2: REVISIONS & DIFF HISTORY */}
               {activeTab === 'revisions' && (
@@ -1901,6 +2074,11 @@
                             }`}>
                               {rev.status}
                             </span>
+                            {rev.git_commit_hash && (
+                              <span className="text-[10px] bg-slate-800 text-indigo-300 border border-indigo-700/50 px-2 py-0.5 rounded font-mono" title={`Git commit: ${rev.git_commit_hash}`}>
+                                🌿 git: {rev.git_commit_hash.slice(0, 7)}
+                              </span>
+                            )}
                           </div>
                           <p className="text-xs text-slate-300">{rev.change_summary || 'No description'}</p>
                           <div className="text-[11px] text-slate-500">
@@ -1932,6 +2110,165 @@
                         </div>
                       </div>
                     ))}
+                  </div>
+                </div>
+              )}
+
+              {/* TAB: AUDIT TRAIL & LOGS */}
+              {activeTab === 'audit' && (
+                <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                  {/* Top Bar */}
+                  <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl flex items-center justify-between">
+                    <div>
+                      <div className="flex items-center space-x-2">
+                        <span className="text-xl">📜</span>
+                        <h2 className="text-base font-bold text-slate-100">Audit Trail & Compliance Log</h2>
+                      </div>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Onweerlegbare log van alle modelbewerkingen, revisiewijzigingen, rollbacks en herstelacties conform ISO/SOC-2 richtlijnen.
+                      </p>
+                    </div>
+
+                    <div className="flex items-center space-x-3 text-xs">
+                      <div>
+                        <label className="text-slate-400 mr-2 font-medium">Actie:</label>
+                        <select
+                          value={auditFilterAction}
+                          onChange={(e) => {
+                            setAuditFilterAction(e.target.value);
+                            fetchAuditLogs(e.target.value, auditFilterResult);
+                          }}
+                          className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1 text-slate-200 focus:outline-none focus:border-indigo-500"
+                        >
+                          <option value="">Alle Acties</option>
+                          <option value="CREATE_MODEL">CREATE_MODEL</option>
+                          <option value="UPDATE_MODEL">UPDATE_MODEL</option>
+                          <option value="ROLLBACK_MODEL">ROLLBACK_MODEL</option>
+                          <option value="DELETE_MODEL">DELETE_MODEL</option>
+                          <option value="RESTORE_MODEL">RESTORE_MODEL</option>
+                          <option value="BATCH_IMPORT">BATCH_IMPORT</option>
+                          <option value="GIT_COMMIT">GIT_COMMIT</option>
+                          <option value="GIT_PULL">GIT_PULL</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="text-slate-400 mr-2 font-medium">Resultaat:</label>
+                        <select
+                          value={auditFilterResult}
+                          onChange={(e) => {
+                            setAuditFilterResult(e.target.value);
+                            fetchAuditLogs(auditFilterAction, e.target.value);
+                          }}
+                          className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1 text-slate-200 focus:outline-none focus:border-indigo-500"
+                        >
+                          <option value="">Alle Resultaten</option>
+                          <option value="SUCCESS">SUCCESS</option>
+                          <option value="FAILED">FAILED</option>
+                        </select>
+                      </div>
+
+                      <button
+                        onClick={() => fetchAuditLogs()}
+                        disabled={auditLoading}
+                        className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded font-medium shadow flex items-center space-x-1"
+                      >
+                        <span>🔄</span>
+                        <span>{auditLoading ? 'Laden...' : 'Verversen'}</span>
+                      </button>
+
+                      <button
+                        onClick={handleCleanupRevisions}
+                        className="px-2.5 py-1.5 bg-slate-800 hover:bg-rose-950 hover:text-rose-300 text-slate-400 rounded text-xs font-medium border border-slate-700"
+                        title="Verwijder gearchiveerde revisies ouder dan 90 dagen (behoud minimaal 5)"
+                      >
+                        🧹 Retentie Opschonen
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Audit Logs Table */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-lg">
+                    {auditLogs && auditLogs.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs font-mono">
+                          <thead>
+                            <tr className="border-b border-slate-800 bg-slate-950/70 text-slate-400 font-sans">
+                              <th className="p-3">Tijdstip</th>
+                              <th className="p-3">Actie</th>
+                              <th className="p-3">Status</th>
+                              <th className="p-3">Model</th>
+                              <th className="p-3">Actor / Bron</th>
+                              <th className="p-3">Revisie</th>
+                              <th className="p-3">Details / Foutmelding</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {auditLogs.map((log) => {
+                              const isSuccess = log.result === 'SUCCESS';
+                              const actionColors = {
+                                CREATE_MODEL: 'bg-emerald-950 text-emerald-300 border-emerald-800',
+                                UPDATE_MODEL: 'bg-indigo-950 text-indigo-300 border-indigo-800',
+                                ROLLBACK_MODEL: 'bg-amber-950 text-amber-300 border-amber-800',
+                                DELETE_MODEL: 'bg-rose-950 text-rose-300 border-rose-800',
+                                RESTORE_MODEL: 'bg-sky-950 text-sky-300 border-sky-800',
+                                BATCH_IMPORT: 'bg-purple-950 text-purple-300 border-purple-800',
+                                GIT_COMMIT: 'bg-teal-950 text-teal-300 border-teal-800',
+                                GIT_PULL: 'bg-blue-950 text-blue-300 border-blue-800',
+                              };
+                              const badgeCls = actionColors[log.action] || 'bg-slate-800 text-slate-300 border-slate-700';
+
+                              return (
+                                <tr key={log.id} className="border-b border-slate-800/50 hover:bg-slate-800/40 text-slate-200">
+                                  <td className="p-3 whitespace-nowrap text-slate-400 text-[11px]">
+                                    {new Date(log.created_at).toLocaleString()}
+                                  </td>
+                                  <td className="p-3 whitespace-nowrap font-sans">
+                                    <span className={`text-[10px] px-2 py-0.5 rounded font-semibold border ${badgeCls}`}>
+                                      {log.action}
+                                    </span>
+                                  </td>
+                                  <td className="p-3 whitespace-nowrap font-sans">
+                                    <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold flex items-center space-x-1 w-max ${
+                                      isSuccess ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-800' : 'bg-rose-950/80 text-rose-300 border border-rose-800'
+                                    }`}>
+                                      <span>{isSuccess ? '✓ SUCCESS' : '✗ FAILED'}</span>
+                                    </span>
+                                  </td>
+                                  <td className="p-3 font-semibold text-slate-200 whitespace-nowrap">
+                                    {log.model_name || '-'}
+                                  </td>
+                                  <td className="p-3 text-slate-300 whitespace-nowrap font-sans">
+                                    <span className="font-mono text-indigo-300">{log.actor}</span>
+                                    <span className="text-slate-500 text-[11px] ml-1">({log.source || 'api'})</span>
+                                  </td>
+                                  <td className="p-3 text-slate-400 whitespace-nowrap">
+                                    {log.revision_id ? (
+                                      <span className="font-mono text-xs text-indigo-300" title={log.revision_id}>
+                                        {log.revision_id.slice(0, 8)}...
+                                      </span>
+                                    ) : '-'}
+                                  </td>
+                                  <td className="p-3 text-[11px] max-w-xs font-sans truncate">
+                                    {log.error_message ? (
+                                      <span className="text-rose-400 font-semibold">{log.error_message}</span>
+                                    ) : (
+                                      <span className="text-slate-400 font-mono text-[10px]">
+                                        {log.details ? JSON.stringify(log.details) : '-'}
+                                      </span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="p-8 text-center text-slate-500 text-xs italic">
+                        {auditLoading ? 'Audit logs worden geladen...' : 'Geen audit log records gevonden voor de geselecteerde filters.'}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

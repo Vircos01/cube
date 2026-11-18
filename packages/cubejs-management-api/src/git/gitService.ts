@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs-extra';
 import { Pool } from 'pg';
 import { exportModelsToDirectory, importModelsFromDirectory } from '../repository/fileMigrator';
+import { logAudit } from '../repository/modelStore';
 
 export interface GitCommitInfo {
   hash: string;
@@ -213,11 +214,23 @@ export class GitService {
       }
     }
 
+    // 4b. Update git_commit_hash on active model_revisions
+    if (latest?.hash) {
+      await pool.query(`
+        UPDATE model_revisions 
+        SET git_commit_hash = $1 
+        WHERE status = 'active'
+      `, [latest.hash]);
+    }
+
     // 5. Audit log
-    await pool.query(`
-      INSERT INTO audit_logs (action, details, actor)
-      VALUES ('GIT_COMMIT', $1, $2)
-    `, [JSON.stringify({ commitHash: latest?.hash, message: params.message, pushed }), params.author || 'system']);
+    await logAudit(pool, {
+      action: 'GIT_COMMIT',
+      actor: authorName,
+      source: 'git',
+      result: 'SUCCESS',
+      details: { commitHash: latest?.hash, message: params.message, pushed }
+    });
 
     return {
       commitHash: latest?.hash || '',
@@ -248,10 +261,13 @@ export class GitService {
     }
 
     // Audit log
-    await pool.query(`
-      INSERT INTO audit_logs (action, details, actor)
-      VALUES ('GIT_PULL', $1, 'system')
-    `, [JSON.stringify({ remote, branch, importedCount })]);
+    await logAudit(pool, {
+      action: 'GIT_PULL',
+      actor: 'system',
+      source: 'git',
+      result: 'SUCCESS',
+      details: { remote, branch, importedCount }
+    });
 
     return {
       pulled: true,

@@ -8,6 +8,7 @@ const child_process_1 = require("child_process");
 const path_1 = __importDefault(require("path"));
 const fs_extra_1 = __importDefault(require("fs-extra"));
 const fileMigrator_1 = require("../repository/fileMigrator");
+const modelStore_1 = require("../repository/modelStore");
 class GitService {
     repoDir;
     modelsSubDir;
@@ -164,11 +165,22 @@ class GitService {
                 console.warn('Git push failed or remote not configured:', err.message);
             }
         }
+        // 4b. Update git_commit_hash on active model_revisions
+        if (latest?.hash) {
+            await pool.query(`
+        UPDATE model_revisions 
+        SET git_commit_hash = $1 
+        WHERE status = 'active'
+      `, [latest.hash]);
+        }
         // 5. Audit log
-        await pool.query(`
-      INSERT INTO audit_logs (action, details, actor)
-      VALUES ('GIT_COMMIT', $1, $2)
-    `, [JSON.stringify({ commitHash: latest?.hash, message: params.message, pushed }), params.author || 'system']);
+        await (0, modelStore_1.logAudit)(pool, {
+            action: 'GIT_COMMIT',
+            actor: authorName,
+            source: 'git',
+            result: 'SUCCESS',
+            details: { commitHash: latest?.hash, message: params.message, pushed }
+        });
         return {
             commitHash: latest?.hash || '',
             message: params.message,
@@ -192,10 +204,13 @@ class GitService {
             importedCount = result.imported.length;
         }
         // Audit log
-        await pool.query(`
-      INSERT INTO audit_logs (action, details, actor)
-      VALUES ('GIT_PULL', $1, 'system')
-    `, [JSON.stringify({ remote, branch, importedCount })]);
+        await (0, modelStore_1.logAudit)(pool, {
+            action: 'GIT_PULL',
+            actor: 'system',
+            source: 'git',
+            result: 'SUCCESS',
+            details: { remote, branch, importedCount }
+        });
         return {
             pulled: true,
             importedCount,

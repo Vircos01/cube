@@ -8,11 +8,15 @@ import {
   updateModel,
   rollbackModel,
   deleteModel,
+  restoreModel,
+  cleanupArchivedRevisions,
+  logAudit,
   getSchemaVersion,
   getActiveSchemaFiles,
   batchUpsertModels,
   BatchModelItem,
 } from '../repository/modelStore';
+import { VersionConflictError } from '../types';
 import { validateSchemaContent, validateBatchSchemas } from '../compiler/validator';
 import {
   upsertDataSource,
@@ -82,7 +86,8 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
   // GET /models - List all models with their active revision
   router.get('/models', async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const models = await getAllModels(pool);
+      const includeDeleted = req.query.includeDeleted === 'true';
+      const models = await getAllModels(pool, { includeDeleted });
       res.json({ models });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -131,6 +136,8 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
         content,
         content_format = 'yaml',
         change_summary,
+        git_commit_hash,
+        source = 'rest_api',
         skip_validation = false,
       } = req.body;
 
@@ -154,7 +161,7 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
         }
       }
 
-      const actor = req.user?.actor || 'system';
+      const actor = req.user?.username || req.user?.actor || 'system';
       const created = await createModel(pool, {
         name,
         model_type,
@@ -163,7 +170,9 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
         content,
         content_format,
         change_summary,
+        git_commit_hash,
         actor,
+        source,
       });
 
       res.status(201).json({ model: created });
@@ -172,51 +181,78 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
     }
   });
 
-  // PUT /models/:id - Update model content (creates a new revision and bumps version)
+  // PUT /models/:id - Update model content with Optimistic Concurrency Control
   router.put('/models/:id', async (req: AuthenticatedRequest, res: Response) => {
     try {
       const { id } = req.params;
-      const { content, content_format = 'yaml', change_summary, description, skip_validation = false } = req.body;
+      const {
+        content,
+        content_format = 'yaml',
+        change_summary,
+        description,
+        expectedRevisionNumber,
+        expectedRevisionId,
+        expectedVersion,
+        git_commit_hash,
+        source = 'rest_api',
+      } = req.body;
 
       if (!content) {
         res.status(400).json({ error: 'Field "content" is required' });
         return;
       }
 
-      const existing = await getModelById(pool, id);
-      if (!existing) {
-        res.status(404).json({ error: `Model ${id} not found` });
-        return;
-      }
-
-      if (!skip_validation) {
-        const existingFiles = await getActiveSchemaFiles(pool);
-        const validation = await validateSchemaContent(content, existing.file_name, existingFiles);
-        if (!validation.valid) {
-          res.status(422).json({
-            error: 'Validation failed',
-            validation,
-          });
-          return;
-        }
-      }
-
-      const actor = req.user?.actor || 'system';
+      const actor = req.user?.username || req.user?.actor || 'system';
       const updated = await updateModel(pool, id, {
         content,
         content_format,
         change_summary,
         description,
+        expectedRevisionNumber,
+        expectedRevisionId,
+        expectedVersion,
+        git_commit_hash,
         actor,
+        source,
       });
 
       res.json({ model: updated });
     } catch (err: any) {
+      // Handle Optimistic Concurrency Conflict (HTTP 409)
+      if (err instanceof VersionConflictError || err.name === 'VersionConflictError') {
+        res.status(409).json({
+          error: 'Versieconflict gedetecteerd',
+          code: 'VERSION_CONFLICT',
+          modelId: err.modelId,
+          expectedRevision: err.expectedRevision,
+          currentRevision: err.currentRevision,
+          currentChangeSummary: err.currentChangeSummary,
+          currentUpdatedBy: err.currentUpdatedBy,
+          message: err.message,
+        });
+        return;
+      }
+
+      // Handle Validation Failure (HTTP 422)
+      if (err.validationErrors) {
+        res.status(422).json({
+          error: 'Validation failed',
+          message: err.message,
+          validationErrors: err.validationErrors,
+        });
+        return;
+      }
+
+      if (err.message && err.message.includes('not found')) {
+        res.status(404).json({ error: err.message });
+        return;
+      }
+
       res.status(500).json({ error: err.message });
     }
   });
 
-  // POST /models/:id/rollback/:revisionNumber - Rollback to older revision
+  // POST /models/:id/rollback/:revisionNumber - Validated atomic rollback to older revision
   router.post('/models/:id/rollback/:revisionNumber', async (req: AuthenticatedRequest, res: Response) => {
     try {
       const { id, revisionNumber } = req.params;
@@ -226,21 +262,68 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
         return;
       }
 
-      const actor = req.user?.actor || 'system';
-      const rolledBack = await rollbackModel(pool, id, revNum, actor);
+      const actor = req.user?.username || req.user?.actor || 'system';
+      const source = (req.body && req.body.source) || 'rest_api';
+      const rolledBack = await rollbackModel(pool, id, revNum, actor, source);
       res.json({ model: rolledBack });
+    } catch (err: any) {
+      if (err.validationErrors) {
+        res.status(422).json({
+          error: 'Rollback validation failed',
+          message: err.message,
+          validationErrors: err.validationErrors,
+        });
+        return;
+      }
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /models/:id/restore - Restore soft-deleted model
+  router.post('/models/:id/restore', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const actor = req.user?.username || req.user?.actor || 'system';
+      const source = (req.body && req.body.source) || 'rest_api';
+      const restored = await restoreModel(pool, id, actor, source);
+      res.json({ success: true, model: restored });
+    } catch (err: any) {
+      if (err.validationErrors) {
+        res.status(422).json({
+          error: 'Restore validation failed',
+          message: err.message,
+          validationErrors: err.validationErrors,
+        });
+        return;
+      }
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // DELETE /models/:id - Soft-delete model
+  router.delete('/models/:id', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const actor = req.user?.username || req.user?.actor || 'system';
+      const source = (req.body && req.body.source) || 'rest_api';
+      await deleteModel(pool, id, actor, source);
+      res.json({ success: true, message: `Model ${id} soft-deleted` });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // DELETE /models/:id - Deactivate model
-  router.delete('/models/:id', async (req: AuthenticatedRequest, res: Response) => {
+  // POST /models/cleanup-revisions - Retention cleanup for archived revisions
+  router.post('/models/cleanup-revisions', async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const { id } = req.params;
-      const actor = req.user?.actor || 'system';
-      await deleteModel(pool, id, actor);
-      res.json({ success: true, message: `Model ${id} deactivated` });
+      const { retentionDays = 90, keepMinRevisions = 5 } = req.body;
+      const actor = req.user?.username || req.user?.actor || 'system';
+      const result = await cleanupArchivedRevisions(pool, {
+        retentionDays: parseInt(retentionDays, 10),
+        keepMinRevisions: parseInt(keepMinRevisions, 10),
+        actor,
+      });
+      res.json({ success: true, ...result });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -616,16 +699,43 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
     }
   });
 
-  // GET /audit-logs - View audit trail
+  // GET /audit-logs - View audit trail with filtering
   router.get('/audit-logs', async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const limit = parseInt((req.query.limit as string) || '50', 10);
+      const limit = parseInt((req.query.limit as string) || '100', 10);
+      const conditions: string[] = [];
+      const params: any[] = [];
+
+      if (req.query.model_name) {
+        params.push(req.query.model_name);
+        conditions.push(`model_name = $${params.length}`);
+      }
+      if (req.query.action) {
+        params.push(req.query.action);
+        conditions.push(`action = $${params.length}`);
+      }
+      if (req.query.actor) {
+        params.push(req.query.actor);
+        conditions.push(`actor = $${params.length}`);
+      }
+      if (req.query.source) {
+        params.push(req.query.source);
+        conditions.push(`source = $${params.length}`);
+      }
+      if (req.query.result) {
+        params.push(req.query.result);
+        conditions.push(`result = $${params.length}`);
+      }
+
+      params.push(limit);
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
       const query = `
         SELECT * FROM audit_logs 
+        ${whereClause}
         ORDER BY created_at DESC 
-        LIMIT $1
+        LIMIT $${params.length}
       `;
-      const result = await pool.query(query, [limit]);
+      const result = await pool.query(query, params);
       res.json({ auditLogs: result.rows });
     } catch (err: any) {
       res.status(500).json({ error: err.message });

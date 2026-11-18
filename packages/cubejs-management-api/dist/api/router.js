@@ -41,6 +41,7 @@ const express_1 = __importStar(require("express"));
 const path_1 = __importDefault(require("path"));
 const pg_1 = require("pg");
 const modelStore_1 = require("../repository/modelStore");
+const types_1 = require("../types");
 const validator_1 = require("../compiler/validator");
 const dataSourceStore_1 = require("../repository/dataSourceStore");
 const introspect_1 = require("./introspect");
@@ -82,7 +83,8 @@ function createManagementRouter(pool, options = {}) {
     // GET /models - List all models with their active revision
     router.get('/models', async (req, res) => {
         try {
-            const models = await (0, modelStore_1.getAllModels)(pool);
+            const includeDeleted = req.query.includeDeleted === 'true';
+            const models = await (0, modelStore_1.getAllModels)(pool, { includeDeleted });
             res.json({ models });
         }
         catch (err) {
@@ -122,7 +124,7 @@ function createManagementRouter(pool, options = {}) {
     // POST /models - Create a new semantic model and revision 1
     router.post('/models', async (req, res) => {
         try {
-            const { name, model_type = 'cube', file_name, description, content, content_format = 'yaml', change_summary, skip_validation = false, } = req.body;
+            const { name, model_type = 'cube', file_name, description, content, content_format = 'yaml', change_summary, git_commit_hash, source = 'rest_api', skip_validation = false, } = req.body;
             if (!name || !content) {
                 res.status(400).json({ error: 'Fields "name" and "content" are required' });
                 return;
@@ -140,7 +142,7 @@ function createManagementRouter(pool, options = {}) {
                     return;
                 }
             }
-            const actor = req.user?.actor || 'system';
+            const actor = req.user?.username || req.user?.actor || 'system';
             const created = await (0, modelStore_1.createModel)(pool, {
                 name,
                 model_type,
@@ -149,7 +151,9 @@ function createManagementRouter(pool, options = {}) {
                 content,
                 content_format,
                 change_summary,
+                git_commit_hash,
                 actor,
+                source,
             });
             res.status(201).json({ model: created });
         }
@@ -157,46 +161,62 @@ function createManagementRouter(pool, options = {}) {
             res.status(500).json({ error: err.message });
         }
     });
-    // PUT /models/:id - Update model content (creates a new revision and bumps version)
+    // PUT /models/:id - Update model content with Optimistic Concurrency Control
     router.put('/models/:id', async (req, res) => {
         try {
             const { id } = req.params;
-            const { content, content_format = 'yaml', change_summary, description, skip_validation = false } = req.body;
+            const { content, content_format = 'yaml', change_summary, description, expectedRevisionNumber, expectedRevisionId, expectedVersion, git_commit_hash, source = 'rest_api', } = req.body;
             if (!content) {
                 res.status(400).json({ error: 'Field "content" is required' });
                 return;
             }
-            const existing = await (0, modelStore_1.getModelById)(pool, id);
-            if (!existing) {
-                res.status(404).json({ error: `Model ${id} not found` });
-                return;
-            }
-            if (!skip_validation) {
-                const existingFiles = await (0, modelStore_1.getActiveSchemaFiles)(pool);
-                const validation = await (0, validator_1.validateSchemaContent)(content, existing.file_name, existingFiles);
-                if (!validation.valid) {
-                    res.status(422).json({
-                        error: 'Validation failed',
-                        validation,
-                    });
-                    return;
-                }
-            }
-            const actor = req.user?.actor || 'system';
+            const actor = req.user?.username || req.user?.actor || 'system';
             const updated = await (0, modelStore_1.updateModel)(pool, id, {
                 content,
                 content_format,
                 change_summary,
                 description,
+                expectedRevisionNumber,
+                expectedRevisionId,
+                expectedVersion,
+                git_commit_hash,
                 actor,
+                source,
             });
             res.json({ model: updated });
         }
         catch (err) {
+            // Handle Optimistic Concurrency Conflict (HTTP 409)
+            if (err instanceof types_1.VersionConflictError || err.name === 'VersionConflictError') {
+                res.status(409).json({
+                    error: 'Versieconflict gedetecteerd',
+                    code: 'VERSION_CONFLICT',
+                    modelId: err.modelId,
+                    expectedRevision: err.expectedRevision,
+                    currentRevision: err.currentRevision,
+                    currentChangeSummary: err.currentChangeSummary,
+                    currentUpdatedBy: err.currentUpdatedBy,
+                    message: err.message,
+                });
+                return;
+            }
+            // Handle Validation Failure (HTTP 422)
+            if (err.validationErrors) {
+                res.status(422).json({
+                    error: 'Validation failed',
+                    message: err.message,
+                    validationErrors: err.validationErrors,
+                });
+                return;
+            }
+            if (err.message && err.message.includes('not found')) {
+                res.status(404).json({ error: err.message });
+                return;
+            }
             res.status(500).json({ error: err.message });
         }
     });
-    // POST /models/:id/rollback/:revisionNumber - Rollback to older revision
+    // POST /models/:id/rollback/:revisionNumber - Validated atomic rollback to older revision
     router.post('/models/:id/rollback/:revisionNumber', async (req, res) => {
         try {
             const { id, revisionNumber } = req.params;
@@ -205,21 +225,68 @@ function createManagementRouter(pool, options = {}) {
                 res.status(400).json({ error: 'Revision number must be an integer' });
                 return;
             }
-            const actor = req.user?.actor || 'system';
-            const rolledBack = await (0, modelStore_1.rollbackModel)(pool, id, revNum, actor);
+            const actor = req.user?.username || req.user?.actor || 'system';
+            const source = (req.body && req.body.source) || 'rest_api';
+            const rolledBack = await (0, modelStore_1.rollbackModel)(pool, id, revNum, actor, source);
             res.json({ model: rolledBack });
+        }
+        catch (err) {
+            if (err.validationErrors) {
+                res.status(422).json({
+                    error: 'Rollback validation failed',
+                    message: err.message,
+                    validationErrors: err.validationErrors,
+                });
+                return;
+            }
+            res.status(500).json({ error: err.message });
+        }
+    });
+    // POST /models/:id/restore - Restore soft-deleted model
+    router.post('/models/:id/restore', async (req, res) => {
+        try {
+            const { id } = req.params;
+            const actor = req.user?.username || req.user?.actor || 'system';
+            const source = (req.body && req.body.source) || 'rest_api';
+            const restored = await (0, modelStore_1.restoreModel)(pool, id, actor, source);
+            res.json({ success: true, model: restored });
+        }
+        catch (err) {
+            if (err.validationErrors) {
+                res.status(422).json({
+                    error: 'Restore validation failed',
+                    message: err.message,
+                    validationErrors: err.validationErrors,
+                });
+                return;
+            }
+            res.status(500).json({ error: err.message });
+        }
+    });
+    // DELETE /models/:id - Soft-delete model
+    router.delete('/models/:id', async (req, res) => {
+        try {
+            const { id } = req.params;
+            const actor = req.user?.username || req.user?.actor || 'system';
+            const source = (req.body && req.body.source) || 'rest_api';
+            await (0, modelStore_1.deleteModel)(pool, id, actor, source);
+            res.json({ success: true, message: `Model ${id} soft-deleted` });
         }
         catch (err) {
             res.status(500).json({ error: err.message });
         }
     });
-    // DELETE /models/:id - Deactivate model
-    router.delete('/models/:id', async (req, res) => {
+    // POST /models/cleanup-revisions - Retention cleanup for archived revisions
+    router.post('/models/cleanup-revisions', async (req, res) => {
         try {
-            const { id } = req.params;
-            const actor = req.user?.actor || 'system';
-            await (0, modelStore_1.deleteModel)(pool, id, actor);
-            res.json({ success: true, message: `Model ${id} deactivated` });
+            const { retentionDays = 90, keepMinRevisions = 5 } = req.body;
+            const actor = req.user?.username || req.user?.actor || 'system';
+            const result = await (0, modelStore_1.cleanupArchivedRevisions)(pool, {
+                retentionDays: parseInt(retentionDays, 10),
+                keepMinRevisions: parseInt(keepMinRevisions, 10),
+                actor,
+            });
+            res.json({ success: true, ...result });
         }
         catch (err) {
             res.status(500).json({ error: err.message });
@@ -568,16 +635,41 @@ function createManagementRouter(pool, options = {}) {
             res.status(500).json({ error: err.message });
         }
     });
-    // GET /audit-logs - View audit trail
+    // GET /audit-logs - View audit trail with filtering
     router.get('/audit-logs', async (req, res) => {
         try {
-            const limit = parseInt(req.query.limit || '50', 10);
+            const limit = parseInt(req.query.limit || '100', 10);
+            const conditions = [];
+            const params = [];
+            if (req.query.model_name) {
+                params.push(req.query.model_name);
+                conditions.push(`model_name = $${params.length}`);
+            }
+            if (req.query.action) {
+                params.push(req.query.action);
+                conditions.push(`action = $${params.length}`);
+            }
+            if (req.query.actor) {
+                params.push(req.query.actor);
+                conditions.push(`actor = $${params.length}`);
+            }
+            if (req.query.source) {
+                params.push(req.query.source);
+                conditions.push(`source = $${params.length}`);
+            }
+            if (req.query.result) {
+                params.push(req.query.result);
+                conditions.push(`result = $${params.length}`);
+            }
+            params.push(limit);
+            const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
             const query = `
         SELECT * FROM audit_logs 
+        ${whereClause}
         ORDER BY created_at DESC 
-        LIMIT $1
+        LIMIT $${params.length}
       `;
-            const result = await pool.query(query, [limit]);
+            const result = await pool.query(query, params);
             res.json({ auditLogs: result.rows });
         }
         catch (err) {

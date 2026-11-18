@@ -4,26 +4,18 @@ import { Pool } from 'pg';
 
 export async function runMigrations(pool: Pool, options: { includeSampleData?: boolean } = {}): Promise<void> {
   const sqlDir = path.resolve(__dirname, '../../sql');
-  const initialSchemaPath = path.join(sqlDir, '001_initial_schema.sql');
-
-  if (await fs.pathExists(initialSchemaPath)) {
-    const initialSchemaSql = await fs.readFile(initialSchemaPath, 'utf8');
-    await pool.query(initialSchemaSql);
-  } else {
-    throw new Error(`Migration file not found at ${initialSchemaPath}`);
+  if (!(await fs.pathExists(sqlDir))) {
+    throw new Error(`SQL directory not found at ${sqlDir}`);
   }
 
-  if (options.includeSampleData) {
-    const sampleDataPath = path.join(sqlDir, '002_sample_data.sql');
-    if (await fs.pathExists(sampleDataPath)) {
-      const sampleDataSql = await fs.readFile(sampleDataPath, 'utf8');
-      await pool.query(sampleDataSql);
+  const files = (await fs.readdir(sqlDir)).filter(f => f.endsWith('.sql')).sort();
+
+  for (const file of files) {
+    if (file.includes('sample_data') && !options.includeSampleData) {
+      continue;
     }
-  }
-
-  const securityRolesPath = path.join(sqlDir, '004_security_roles.sql');
-  if (await fs.pathExists(securityRolesPath)) {
-    const securityRolesSql = await fs.readFile(securityRolesPath, 'utf8');
-    await pool.query(securityRolesSql);
+    const filePath = path.join(sqlDir, file);
+    const sql = await fs.readFile(filePath, 'utf8');
+    await pool.query(sql);
   }
 }
