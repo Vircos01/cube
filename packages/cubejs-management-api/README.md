@@ -59,6 +59,15 @@ Alle endpoints ondersteunen Bearer token authenticatie (`Authorization: Bearer <
 - `POST /management/v1/models/import` — Bestaande YAML/JS bestanden importeren naar PostgreSQL
 - `POST /management/v1/models/export` — Actieve modellen exporteren naar YAML-bestanden op schijf
 
+### 🌿 Git & Versiebeheer Endpoints:
+- `GET /management/v1/git/status` — Huidige Git branch, schone/vuile status en uncommitted wijzigingen
+- `GET /management/v1/git/diff` — Live `git diff` van modellen ten opzichte van Git HEAD
+- `GET /management/v1/git/log` — Recente Git commits (auteur, hash, datum, bericht)
+- `GET /management/v1/git/branches` — Lijst van Git branches
+- `POST /management/v1/git/commit` — Modellen exporteren, stagen en een Git commit maken (met optionele `push: true`)
+- `POST /management/v1/git/pull` — Nieuwste commits ophalen van remote en modellen synchroniseren naar PostgreSQL
+- `POST /management/v1/git/checkout` — Wisselen van branch of nieuwe branch aanmaken
+
 ---
 
 ## 🧪 Tests Uitvoeren

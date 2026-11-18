@@ -15,10 +15,12 @@ import { validateSchemaContent } from '../compiler/validator';
 import { introspectPostgresDatabase } from './introspect';
 import { createAuthMiddleware, AuthenticatedRequest } from './auth';
 import { importModelsFromDirectory, exportModelsToDirectory } from '../repository/fileMigrator';
+import { GitService } from '../git/gitService';
 
-export function createManagementRouter(pool: Pool, options: { apiSecret?: string } = {}): Router {
+export function createManagementRouter(pool: Pool, options: { apiSecret?: string; gitService?: GitService } = {}): Router {
   const router = Router();
   const auth = createAuthMiddleware(options.apiSecret);
+  const git = options.gitService || new GitService();
 
   // Web-UI static dashboard on /admin
   const publicDir = path.resolve(__dirname, '../../public');
@@ -252,6 +254,97 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
       `;
       const result = await pool.query(query, [limit]);
       res.json({ auditLogs: result.rows });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // --- GIT INTEGRATION ENDPOINTS ---
+
+  // GET /git/status
+  router.get('/git/status', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const isAvailable = await git.isGitAvailable();
+      if (!isAvailable) {
+        res.json({ available: false, error: 'Git repository not found or not initialized' });
+        return;
+      }
+      const status = await git.getStatus(pool);
+      res.json({ available: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /git/diff
+  router.get('/git/diff', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const staged = req.query.staged === 'true';
+      const result = await git.getDiff(staged);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /git/log
+  router.get('/git/log', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const limit = parseInt((req.query.limit as string) || '20', 10);
+      const log = await git.getLog(limit);
+      res.json({ commits: log });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /git/branches
+  router.get('/git/branches', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const result = await git.listBranches();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /git/commit
+  router.post('/git/commit', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { message, push = false } = req.body;
+      if (!message) {
+        res.status(400).json({ error: 'Field "message" is required for git commit' });
+        return;
+      }
+      const author = req.user?.actor || 'Cube Web-UI';
+      const result = await git.commitChanges(pool, { message, author, push });
+      res.json({ success: true, ...result });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /git/pull
+  router.post('/git/pull', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { remote = 'origin', branch } = req.body;
+      const result = await git.pullChanges(pool, { remote, branch });
+      res.json({ success: true, ...result });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /git/checkout
+  router.post('/git/checkout', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { branch, createNew = false } = req.body;
+      if (!branch) {
+        res.status(400).json({ error: 'Field "branch" is required' });
+        return;
+      }
+      const result = await git.checkoutBranch(branch, createNew, pool);
+      res.json({ success: true, ...result });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

@@ -21,7 +21,9 @@ services:
       retries: 10
 
   cube:
-    image: cubejs/cube:latest
+    build:
+      context: ./runtime
+      dockerfile: Dockerfile
     container_name: cube-core-server
     restart: unless-stopped
     depends_on:
@@ -29,6 +31,9 @@ services:
         condition: service_healthy
     env_file:
       - ./runtime/.env
+    environment:
+      - GIT_REPO_DIR=/workspace
+      - GIT_MODELS_DIR=model
     ports:
       - "4000:4000"    # Cube API Server & Playground
       - "4001:4001"    # Web-UI & Management REST API (/admin)
@@ -36,6 +41,7 @@ services:
     volumes:
       - ./runtime/cube.js:/cube/conf/cube.js
       - ./packages/cubejs-management-api:/management-api
+      - .:/workspace
 
 volumes:
   cube_pgdata:

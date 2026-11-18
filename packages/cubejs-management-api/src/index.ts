@@ -5,6 +5,7 @@ export * from './repository/modelStore';
 export * from './repository/PostgresSchemaRepository';
 export * from './repository/schemaVersion';
 export * from './repository/fileMigrator';
+export * from './git/gitService';
 export * from './compiler/validator';
 export * from './api/auth';
 export * from './api/router';

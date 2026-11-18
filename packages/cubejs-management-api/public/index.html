@@ -55,6 +55,15 @@
       const [queryResult, setQueryResult] = useState(null);
       const [queryRunning, setQueryRunning] = useState(false);
 
+      // Git state
+      const [gitStatus, setGitStatus] = useState(null);
+      const [gitDiff, setGitDiff] = useState('');
+      const [gitLog, setGitLog] = useState([]);
+      const [gitBranches, setGitBranches] = useState({ current: 'master', branches: ['master'] });
+      const [commitMessage, setCommitMessage] = useState('');
+      const [pushToRemote, setPushToRemote] = useState(false);
+      const [gitLoading, setGitLoading] = useState(false);
+
       const monacoRef = useRef(null);
       const editorInstance = useRef(null);
 
@@ -306,6 +315,126 @@
         }
       };
 
+      // Git Integration Functions
+      const fetchGitStatus = async () => {
+        try {
+          const res = await fetch('/management/v1/git/status', { headers: getHeaders() });
+          const data = await res.json();
+          setGitStatus(data);
+        } catch (e) {
+          console.warn('Git status error:', e.message);
+        }
+      };
+
+      const fetchGitDiff = async () => {
+        try {
+          const res = await fetch('/management/v1/git/diff', { headers: getHeaders() });
+          const data = await res.json();
+          setGitDiff(data.diff || '');
+        } catch (e) {
+          console.warn('Git diff error:', e.message);
+        }
+      };
+
+      const fetchGitLog = async () => {
+        try {
+          const res = await fetch('/management/v1/git/log', { headers: getHeaders() });
+          const data = await res.json();
+          setGitLog(data.commits || []);
+        } catch (e) {
+          console.warn('Git log error:', e.message);
+        }
+      };
+
+      const fetchGitBranches = async () => {
+        try {
+          const res = await fetch('/management/v1/git/branches', { headers: getHeaders() });
+          const data = await res.json();
+          if (data.branches) setGitBranches(data);
+        } catch (e) {
+          console.warn('Git branches error:', e.message);
+        }
+      };
+
+      const handleGitCommit = async () => {
+        if (!commitMessage.trim()) {
+          notify('Please enter a commit message', 'error');
+          return;
+        }
+        setGitLoading(true);
+        try {
+          const res = await fetch('/management/v1/git/commit', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({ message: commitMessage, push: pushToRemote })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            notify(`✓ Committed to Git (${data.commitHash.slice(0, 7)}) ${data.pushed ? 'and pushed to remote!' : ''}`);
+            setCommitMessage('');
+            fetchGitStatus();
+            fetchGitDiff();
+            fetchGitLog();
+          } else {
+            notify(`Git commit failed: ${data.error}`, 'error');
+          }
+        } catch (e) {
+          notify(`Error: ${e.message}`, 'error');
+        } finally {
+          setGitLoading(false);
+        }
+      };
+
+      const handleGitPull = async () => {
+        setGitLoading(true);
+        try {
+          const res = await fetch('/management/v1/git/pull', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({})
+          });
+          const data = await res.json();
+          if (res.ok) {
+            notify(`✓ Pulled from Git! Synced ${data.importedCount || 0} models into PostgreSQL.`);
+            fetchHealth();
+            fetchModels();
+            fetchGitStatus();
+            fetchGitLog();
+          } else {
+            notify(`Git pull failed: ${data.error}`, 'error');
+          }
+        } catch (e) {
+          notify(`Error: ${e.message}`, 'error');
+        } finally {
+          setGitLoading(false);
+        }
+      };
+
+      const handleGitCheckout = async (branch, createNew = false) => {
+        setGitLoading(true);
+        try {
+          const res = await fetch('/management/v1/git/checkout', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({ branch, createNew })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            notify(`✓ Switched to branch "${branch}" and synced models!`);
+            fetchHealth();
+            fetchModels();
+            fetchGitStatus();
+            fetchGitBranches();
+          } else {
+            notify(`Checkout failed: ${data.error}`, 'error');
+          }
+        } catch (e) {
+          notify(`Error: ${e.message}`, 'error');
+        } finally {
+          setGitLoading(false);
+        }
+      };
+
       // Initialize Monaco Editor
       useEffect(() => {
         require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
@@ -337,6 +466,10 @@
         fetchHealth();
         fetchModels();
         loadIntrospect();
+        fetchGitStatus();
+        fetchGitBranches();
+        fetchGitLog();
+        fetchGitDiff();
       }, [apiSecret]);
 
       // Helper to update field in current form
@@ -418,6 +551,22 @@
                 <span className="text-slate-400">Schema Version:</span>
                 <span className="font-mono text-emerald-300 font-semibold">{schemaVersion}</span>
               </div>
+
+              {gitStatus && (
+                <button 
+                  onClick={() => { setActiveTab('git'); fetchGitStatus(); fetchGitDiff(); }}
+                  className="flex items-center space-x-1.5 text-xs bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 rounded-full border border-slate-700 transition-colors"
+                  title="Git Version Control"
+                >
+                  <span className="text-amber-400">🌿</span>
+                  <span className="font-mono text-slate-200 font-semibold">{gitStatus.branch || 'master'}</span>
+                  {!gitStatus.isClean ? (
+                    <span className="text-[10px] bg-amber-950 text-amber-300 border border-amber-800 px-1 rounded-full font-mono">modified</span>
+                  ) : (
+                    <span className="text-[10px] text-emerald-400 font-mono">clean</span>
+                  )}
+                </button>
+              )}
 
               <div className="flex items-center space-x-2 text-xs text-slate-400 bg-slate-800/50 px-2 py-1 rounded border border-slate-700/50">
                 <span>SQL-API:</span>
@@ -536,7 +685,8 @@
                 <div className="flex space-x-1">
                   {[
                     { id: 'editor', label: 'Visual & YAML Split-View' },
-                    { id: 'revisions', label: 'Version History & Rollback' },
+                    { id: 'git', label: '🌿 Git & Version Control' },
+                    { id: 'revisions', label: 'DB Revisions & Rollback' },
                     { id: 'query', label: 'Query & SQL Tester' },
                     { id: 'introspect', label: 'Database Introspection' }
                   ].map(tab => (
@@ -855,6 +1005,187 @@
                         ))}
                       </div>
                     )}
+                  </div>
+                </div>
+              )}
+
+              {/* TAB: GIT & VERSION CONTROL */}
+              {activeTab === 'git' && (
+                <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                  {/* Top Bar: Branch & Actions */}
+                  <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl flex items-center justify-between">
+                    <div className="flex items-center space-x-4">
+                      <div className="flex items-center space-x-2">
+                        <span className="text-xl">🌿</span>
+                        <div>
+                          <div className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold">Active Git Branch</div>
+                          <div className="flex items-center space-x-2 mt-0.5">
+                            <select
+                              value={gitBranches.current}
+                              onChange={(e) => handleGitCheckout(e.target.value)}
+                              className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1 text-xs font-mono font-bold text-indigo-300 focus:outline-none focus:border-indigo-500"
+                            >
+                              {gitBranches.branches.map(b => (
+                                <option key={b} value={b}>{b}</option>
+                              ))}
+                            </select>
+                            <button
+                              onClick={() => {
+                                const newBranch = prompt('Enter new branch name (e.g. feature/new-metrics):');
+                                if (newBranch) handleGitCheckout(newBranch, true);
+                              }}
+                              className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium"
+                              title="Create and checkout new branch"
+                            >
+                              + New Branch
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="h-8 border-r border-slate-800"></div>
+
+                      <div>
+                        <div className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold">Working Tree</div>
+                        <div className="flex items-center space-x-2 mt-0.5">
+                          {gitStatus && gitStatus.isClean ? (
+                            <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-300 border border-emerald-800 font-medium">
+                              ✓ Clean (Models Synced with Git)
+                            </span>
+                          ) : (
+                            <span className="text-xs px-2 py-0.5 rounded-full bg-amber-950 text-amber-300 border border-amber-800 font-medium">
+                              ⚠️ Pending Changes in Models
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center space-x-2">
+                      <button
+                        onClick={handleGitPull}
+                        disabled={gitLoading}
+                        className="text-xs px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium flex items-center space-x-1 border border-slate-700"
+                        title="Pull latest models from remote Git into PostgreSQL"
+                      >
+                        <span>⬇ Pull from Git</span>
+                      </button>
+                      <button
+                        onClick={() => { fetchGitStatus(); fetchGitDiff(); fetchGitLog(); }}
+                        className="text-xs px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-400"
+                        title="Refresh Git status"
+                      >
+                        ↻
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Commit Box & Diff */}
+                  <div className="grid grid-cols-2 gap-6">
+                    {/* Commit Box */}
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-4">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">Commit Models to Git</h3>
+                      <p className="text-xs text-slate-400">
+                        Exports the current active PostgreSQL models to the repository, stages them, and creates a Git commit.
+                      </p>
+
+                      <div>
+                        <label className="text-[11px] font-medium text-slate-400">Commit Message</label>
+                        <textarea
+                          placeholder="e.g. feat(models): add Orders.avg_order_value measure and Users join"
+                          value={commitMessage}
+                          onChange={(e) => setCommitMessage(e.target.value)}
+                          className="w-full h-24 bg-slate-950 border border-slate-800 rounded p-2.5 text-xs text-slate-200 mt-1 focus:outline-none focus:border-indigo-500 font-sans"
+                        />
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <label className="flex items-center space-x-2 text-xs text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={pushToRemote}
+                            onChange={(e) => setPushToRemote(e.target.checked)}
+                            className="rounded bg-slate-950 border-slate-800"
+                          />
+                          <span>Push to remote repository (`origin/{gitBranches.current}`)</span>
+                        </label>
+
+                        <button
+                          onClick={handleGitCommit}
+                          disabled={gitLoading || !commitMessage.trim()}
+                          className={`text-xs px-4 py-2 rounded font-semibold text-white shadow flex items-center space-x-1.5 ${
+                            gitLoading || !commitMessage.trim()
+                              ? 'bg-slate-700 opacity-60 cursor-not-allowed'
+                              : 'bg-emerald-600 hover:bg-emerald-500'
+                          }`}
+                        >
+                          <span>{gitLoading ? 'Committing...' : 'Commit to Git'}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Git Diff Viewer */}
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl flex flex-col space-y-2">
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">Uncommitted Git Diff</h3>
+                        <span className="text-[10px] text-slate-500 font-mono">
+                          {gitDiff ? `${(gitDiff.match(/^diff --git/gm) || []).length} file(s) changed` : 'No uncommitted changes'}
+                        </span>
+                      </div>
+                      <div className="flex-1 bg-slate-950 border border-slate-800/80 rounded p-3 overflow-auto max-h-56 font-mono text-xs">
+                        {gitDiff ? (
+                          gitDiff.split('\n').map((line, idx) => {
+                            let color = 'text-slate-300';
+                            if (line.startsWith('+') && !line.startsWith('+++')) color = 'text-emerald-400 bg-emerald-950/30';
+                            else if (line.startsWith('-') && !line.startsWith('---')) color = 'text-rose-400 bg-rose-950/30';
+                            else if (line.startsWith('@@')) color = 'text-indigo-400 font-bold';
+
+                            return (
+                              <div key={idx} className={`py-0.5 px-1 ${color}`}>
+                                {line}
+                              </div>
+                            );
+                          })
+                        ) : (
+                          <div className="text-slate-500 italic p-4 text-center">
+                            No uncommitted changes. Current models match Git HEAD.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Git Commit History */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">Recent Git Commits</h3>
+                      <span className="text-[11px] text-slate-500 font-mono">{gitLog.length} commits</span>
+                    </div>
+
+                    <div className="space-y-2">
+                      {gitLog.map((c) => (
+                        <div key={c.hash} className="bg-slate-900 border border-slate-800 p-3 rounded-lg flex items-center justify-between hover:border-slate-700 transition-colors">
+                          <div className="space-y-1">
+                            <div className="flex items-center space-x-2">
+                              <span className="font-mono text-xs px-2 py-0.5 rounded bg-slate-800 text-indigo-300 font-bold border border-slate-700">
+                                {c.shortHash}
+                              </span>
+                              <span className="text-xs font-semibold text-slate-200">{c.message}</span>
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              by <span className="text-slate-400">{c.author}</span> • {new Date(c.date).toLocaleString()}
+                            </div>
+                          </div>
+                          <span className="text-[10px] text-slate-500 font-mono truncate max-w-xs">{c.hash}</span>
+                        </div>
+                      ))}
+
+                      {gitLog.length === 0 && (
+                        <div className="text-xs text-slate-500 italic p-4 text-center">
+                          No commits found in Git repository.
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               )}

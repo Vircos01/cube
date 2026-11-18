@@ -21,6 +21,7 @@ __exportStar(require("./repository/modelStore"), exports);
 __exportStar(require("./repository/PostgresSchemaRepository"), exports);
 __exportStar(require("./repository/schemaVersion"), exports);
 __exportStar(require("./repository/fileMigrator"), exports);
+__exportStar(require("./git/gitService"), exports);
 __exportStar(require("./compiler/validator"), exports);
 __exportStar(require("./api/auth"), exports);
 __exportStar(require("./api/router"), exports);
