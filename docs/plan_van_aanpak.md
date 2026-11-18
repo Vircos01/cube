@@ -141,23 +141,26 @@ Een fase is pas afgerond wanneer de acceptatiecriteria zijn gehaald, inclusief g
   - [docs/deployment_en_operatie.md](file:///Users/remcovisser/Dev/Cube/docs/deployment_en_operatie.md): Productiearchitectuur, containertopologie, secrets management, reverse proxy TLS configuratie en incident playbooks.
 - **Automatisering**: 50/50 geautomatiseerde unit- en integratietests geslaagd.
 
-## Fase 6 — BI-compatibiliteit en releasecriteria
+## Fase 6 — BI-compatibiliteit en releasecriteria [VOLTOOID]
 
 **Doel:** aantonen dat de afgesproken BI-clients correct en veilig werken.
 
-**Werk:**
-
-- Test de afgesproken clients tegen REST- en/of SQL-interface, inclusief metadata discovery, datatype-mapping, tijdzones, nulls, pagination en foutafhandeling.
-- Controleer queryresultaten en beveiligingsbeleid met representatieve datasets en rollen.
-- Voeg migratie- en upgradecompatibiliteit toe voor metadata-schema en modeldefinities.
-- Maak een releasechecklist met ondersteunde drivers, protocollen, bekende beperkingen en compatibility matrix.
-
-**Acceptatiecriteria:**
-
-- Elke ondersteunde BI-client doorloopt een geautomatiseerde smoke-/compatibility-suite.
-- Resultaten en beveiligingsregels zijn voor dezelfde query consistent over de ondersteunde interfaces.
-- Een upgrade behoudt modellen, revisies, toegangsbeleid en databronconfiguratie, of levert een gevalideerd migratiepad.
-- Release notes noemen expliciet incompatibele wijzigingen en bekende beperkingen.
+**Opgeleverd:**
+- **Geautomatiseerde Compatibility Suite**:
+  - `packages/cubejs-management-api/test/integration/biCompatibility.test.ts` toetst live Cube SQL (poort 15432) en Cube REST (poort 4000).
+  - Toetst metadata discovery (`information_schema.tables`, `information_schema.columns` en `/meta`).
+  - Toetst datatype-mapping (integers, strings, floats/numerics, timestamps), aggregaties, null-handling en LIMIT/OFFSET paginering.
+- **Cross-Interface Parity (Resultaat- & Beveiligingsconsistentie)**:
+  - Verifieert dat `admin` identieke totalen ontvangt over SQL en REST (€ 999.46 over 4 orders).
+  - Verifieert dat `sales_amsterdam` via RLS uitsluitend de 2 Amsterdamse orders ontvangt op zowel SQL als REST (€ 399.49).
+  - Verifieert dat `sales_rotterdam` via RLS uitsluitend de 2 Rotterdamse orders ontvangt op zowel SQL als REST (€ 328.99).
+  - Verifieert dat afgeschermde maatstaven (`Orders.avg_order_value`) via Object-Level Security (OLS) op **beide interfaces** waterdicht worden geweigerd met een identieke Nederlandstalige toegangsbeperkingsmelding.
+- **Cache-Isolatie (`contextToAppId`)**:
+  - Dynamische segmentatie van query- en rollup-caches per beveiligingsrol en claims (`CUBE_APP_<role>_<claims>`) in `runtime/cube.js` om data-lekkage tussen gebruikers te voorkomen.
+- **Documentatie & Releasechecklist**:
+  - [docs/bi_compatibiliteit_en_release.md](file:///Users/remcovisser/Dev/Cube/docs/bi_compatibiliteit_en_release.md): BI Compatibility Matrix (Power BI, Tableau, Superset, DBeaver, Excel), protocol-specificaties, datatype mapping tabel, bekende beperkingen en de 10-punts releasechecklist.
+  - Release Notes voor VAS v1.0.0 Enterprise met migratiepad voor bestandsgebaseerde schema's.
+- **Automatisering**: 62/62 geautomatiseerde tests geslaagd over 9 testsuites (`yarn test`).
 
 ## Aanbevolen volgorde en besluitmomenten
 

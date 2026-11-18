@@ -1,6 +1,7 @@
 const { Pool } = require('pg');
 const path = require('path');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 
 const pool = new Pool({
   host: process.env.CUBEJS_DB_HOST || 'localhost',
@@ -142,7 +143,63 @@ module.exports = {
     }
   },
 
-  // 1. SQL-API Authentication Hook (PostgreSQL-wire protocol / Apache Superset / BI tools)
+  // 1a. REST-API & GraphQL Authentication Hook (port 4000)
+  // Decodeert en valideert JWT tokens of weigert toegang in productie (deny-by-default)
+  checkAuth: async (req, auth) => {
+    const token = auth || (req.headers && (req.headers.authorization || req.headers.Authorization));
+    const rawToken = token ? token.replace(/^Bearer\s+/i, '') : null;
+    const apiSecret = process.env.CUBEJS_API_SECRET || 'mysecretkey123';
+
+    if (rawToken) {
+      try {
+        const decoded = jwt.verify(rawToken, apiSecret);
+        const userObj = decoded.u || decoded.user || decoded;
+
+        const role = userObj.role || userObj.role_id || (userObj.isAdmin ? 'admin' : 'viewer');
+        const claims = userObj.claims || {};
+        const isAdmin = Boolean(userObj.isAdmin || role === 'admin');
+
+        req.securityContext = {
+          username: userObj.username || 'api_user',
+          name: userObj.name || userObj.display_name || userObj.username || 'API User',
+          role,
+          isAdmin,
+          claims,
+        };
+        return;
+      } catch (err) {
+        console.warn('[checkAuth] JWT verificatie mislukt:', err.message);
+        throw new Error(`[Authentication Failed] Ongeldig of verstreken token: ${err.message}`);
+      }
+    }
+
+    // Deny-by-default in productie of wanneer dev mode expliciet uit staat
+    if (process.env.NODE_ENV === 'production' || process.env.CUBEJS_DEV_MODE === 'false') {
+      throw new Error('[Authentication Failed] Geen authenticatietoken meegegeven');
+    }
+
+    // Default context in ontwikkelmodus als er geen Bearer token is meegegeven
+    req.securityContext = {
+      username: 'dev_user',
+      name: 'Developer',
+      role: 'admin',
+      isAdmin: true,
+      claims: { region: 'global' },
+    };
+  },
+
+  // Cache-isolatie per beveiligingscontext zodat RLS queries niet cross-contamineren in pre-aggregaties
+  contextToAppId: ({ securityContext }) => {
+    if (!securityContext) return 'CUBE_APP_ANON';
+    const role = securityContext.role || 'viewer';
+    const claimsKey = Object.entries(securityContext.claims || {})
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}:${v}`)
+      .join(';');
+    return `CUBE_APP_${role}_${claimsKey || 'default'}`;
+  },
+
+  // 1b. SQL-API Authentication Hook (PostgreSQL-wire protocol / Apache Superset / BI tools)
   // Dynamisch gevoed vanuit de centrale PostgreSQL database (user_accounts + security_roles)
   checkSqlAuth: async (req, user, password) => {
     console.log(`[checkSqlAuth] Authenticating SQL user: '${user}'`);
