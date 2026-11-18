@@ -3,6 +3,8 @@ export * from './db/pool';
 export * from './db/migrator';
 export * from './repository/modelStore';
 export * from './repository/dataSourceStore';
+export * from './repository/securityStore';
+export * from './security/password';
 export * from './repository/PostgresSchemaRepository';
 export * from './repository/schemaVersion';
 export * from './repository/fileMigrator';

@@ -19,6 +19,8 @@ __exportStar(require("./db/pool"), exports);
 __exportStar(require("./db/migrator"), exports);
 __exportStar(require("./repository/modelStore"), exports);
 __exportStar(require("./repository/dataSourceStore"), exports);
+__exportStar(require("./repository/securityStore"), exports);
+__exportStar(require("./security/password"), exports);
 __exportStar(require("./repository/PostgresSchemaRepository"), exports);
 __exportStar(require("./repository/schemaVersion"), exports);
 __exportStar(require("./repository/fileMigrator"), exports);

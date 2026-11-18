@@ -136,4 +136,38 @@ export interface CreateDataSourceInput {
     schema_name?: string;
     ssl?: boolean;
 }
+export interface SecurityRole {
+    id: string;
+    name: string;
+    display_name: string;
+    description?: string;
+    is_admin: boolean;
+    can_manage_models: boolean;
+    can_manage_datasources: boolean;
+    created_at: Date;
+    updated_at: Date;
+    policies?: AccessPolicy[];
+}
+export interface UserAccount {
+    id: string;
+    username: string;
+    password_hash?: string;
+    display_name: string;
+    email?: string;
+    role_id: string;
+    claims: Record<string, any>;
+    is_active: boolean;
+    created_at: Date;
+    updated_at: Date;
+}
+export interface AccessPolicy {
+    id: string;
+    role_id: string;
+    cube_name: string;
+    policy_type: 'RLS' | 'OLS';
+    definition: Record<string, any>;
+    is_active: boolean;
+    created_at: Date;
+    updated_at: Date;
+}
 //# sourceMappingURL=types.d.ts.map

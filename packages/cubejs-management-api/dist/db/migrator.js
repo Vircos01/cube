@@ -23,5 +23,10 @@ async function runMigrations(pool, options = {}) {
             await pool.query(sampleDataSql);
         }
     }
+    const securityRolesPath = path_1.default.join(sqlDir, '004_security_roles.sql');
+    if (await fs_extra_1.default.pathExists(securityRolesPath)) {
+        const securityRolesSql = await fs_extra_1.default.readFile(securityRolesPath, 'utf8');
+        await pool.query(securityRolesSql);
+    }
 }
 //# sourceMappingURL=migrator.js.map

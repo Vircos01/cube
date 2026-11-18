@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
 const path = require('path');
+const crypto = require('crypto');
 
 const pool = new Pool({
   host: process.env.CUBEJS_DB_HOST || 'localhost',
@@ -8,6 +9,31 @@ const pool = new Pool({
   password: process.env.CUBEJS_DB_PASS || 'postgres',
   database: process.env.CUBEJS_DB_NAME || 'cubedb',
 });
+
+// Helper for constant-time password verification using scrypt
+function verifyPassword(password, storedHash) {
+  if (!storedHash) return false;
+  if (storedHash.startsWith('scrypt:')) {
+    const parts = storedHash.split(':');
+    if (parts.length !== 3) return false;
+    const [, salt, hash] = parts;
+    const computed = crypto.scryptSync(password, salt, 64).toString('hex');
+    try {
+      return crypto.timingSafeEqual(Buffer.from(computed, 'hex'), Buffer.from(hash, 'hex'));
+    } catch {
+      return false;
+    }
+  }
+  // Constant-time compare fallback for demo/seed passwords
+  try {
+    const a = Buffer.from(password);
+    const b = Buffer.from(storedHash);
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
 
 // Start Management API & Web-UI on port 4001
 try {
@@ -110,101 +136,168 @@ module.exports = {
   },
 
   // 1. SQL-API Authentication Hook (PostgreSQL-wire protocol / Apache Superset / BI tools)
+  // Dynamisch gevoed vanuit de centrale PostgreSQL database (user_accounts + security_roles)
   checkSqlAuth: async (req, user, password) => {
     console.log(`[checkSqlAuth] Authenticating SQL user: '${user}'`);
 
-    // Rol 1: Global Admin - volledige ongefilterde toegang
-    if (user === 'admin' && password === 'admin') {
+    try {
+      const res = await pool.query(`
+        SELECT u.*, r.is_admin, r.can_manage_models, r.can_manage_datasources
+        FROM user_accounts u
+        JOIN security_roles r ON u.role_id = r.name
+        WHERE u.username = $1 AND u.is_active = true
+      `, [user]);
+
+      if (res.rows.length === 0) {
+        console.warn(`[checkSqlAuth] User '${user}' niet gevonden of inactief`);
+        throw new Error(`[Authentication Failed] Ongeldige inloggegevens voor SQL user: '${user}'`);
+      }
+
+      const userRow = res.rows[0];
+      const isValid = verifyPassword(password, userRow.password_hash);
+      if (!isValid) {
+        console.warn(`[checkSqlAuth] Ongeldig wachtwoord voor user '${user}'`);
+        throw new Error(`[Authentication Failed] Ongeldige inloggegevens voor SQL user: '${user}'`);
+      }
+
+      console.log(`[checkSqlAuth] Succesvol geauthenticeerd: '${user}' (rol: ${userRow.role_id}, admin: ${userRow.is_admin})`);
       return {
-        password: 'admin',
-        superuser: true,
+        password,
+        superuser: userRow.is_admin || false,
         securityContext: {
-          username: 'admin',
-          name: 'Global Administrator',
-          role: 'admin'
+          username: userRow.username,
+          name: userRow.display_name,
+          role: userRow.role_id,
+          isAdmin: userRow.is_admin || false,
+          claims: userRow.claims || {},
         }
       };
+    } catch (err) {
+      console.error(`[checkSqlAuth] Auth fout voor '${user}':`, err.message);
+      throw err;
     }
-
-    // Rol 2: Sales Rep Amsterdam - RLS actief (alleen Amsterdam), OLS actief (geen avg_order_value)
-    if (user === 'sales_amsterdam' && password === 'amsterdam123') {
-      return {
-        password: 'amsterdam123',
-        superuser: false,
-        securityContext: {
-          username: 'sales_amsterdam',
-          name: 'Amsterdam Sales Representative',
-          role: 'sales_rep',
-          city: 'Amsterdam',
-          denyMeasures: ['Orders.avg_order_value']
-        }
-      };
-    }
-
-    // Rol 3: Sales Rep Rotterdam - RLS actief (alleen Rotterdam)
-    if (user === 'sales_rotterdam' && password === 'rotterdam123') {
-      return {
-        password: 'rotterdam123',
-        superuser: false,
-        securityContext: {
-          username: 'sales_rotterdam',
-          name: 'Rotterdam Sales Representative',
-          role: 'sales_rep',
-          city: 'Rotterdam'
-        }
-      };
-    }
-
-    // Fallback voor standaard cube user
-    if (user === 'cube' && password === 'cube') {
-      return {
-        password: 'cube',
-        superuser: true,
-        securityContext: { role: 'admin', username: 'cube' }
-      };
-    }
-
-    throw new Error(`[Authentication Failed] Ongeldige inloggegevens voor SQL user: '${user}'`);
   },
 
-  // 2. QueryRewrite Hook: Dynamische RLS & OLS handhaving (werkt voor SQL-API én REST-API)
+  // 2. QueryRewrite Hook: Dynamische configuratie-gestuurde RLS & OLS handhaving
+  // Werkt voor SQL-API (15432) én REST-API (4000)
   queryRewrite: async (query, { securityContext }) => {
-    // Admin heeft altijd volledige ongefilterde toegang
-    if (!securityContext || securityContext.role === 'admin' || securityContext.superuser) {
+    // Admin / superuser heeft altijd volledige ongefilterde toegang
+    if (!securityContext || securityContext.role === 'admin' || securityContext.isAdmin || securityContext.superuser) {
       return query;
     }
 
-    console.log(`[queryRewrite] Actieve beveiligingspolicy voor user: '${securityContext.username}', rol: '${securityContext.role}'`);
+    const userRole = securityContext.role;
+    const username = securityContext.username || 'anonymous';
+    const userClaims = securityContext.claims || {};
 
-    // A. Object-Level Security (OLS): Kolommen / Maatstaven blokkeren voor niet-geautoriseerde rollen
-    if (securityContext.denyMeasures && Array.isArray(securityContext.denyMeasures)) {
-      const requestedMeasures = query.measures || [];
-      for (const denied of securityContext.denyMeasures) {
-        if (requestedMeasures.includes(denied)) {
-          throw new Error(
-            `[Access Denied] Maatstaf '${denied}' is afgeschermd (Object-Level Security) en niet toegankelijk voor rol '${securityContext.role}'.`
-          );
+    console.log(`[queryRewrite] Actieve beveiligingspolicy voor user: '${username}', rol: '${userRole}'`);
+
+    // Dynamisch policies ophalen uit PostgreSQL voor de actieve rol
+    let policies = [];
+    try {
+      const res = await pool.query(
+        'SELECT * FROM access_policies WHERE role_id = $1 AND is_active = true ORDER BY cube_name ASC',
+        [userRole]
+      );
+      policies = res.rows;
+    } catch (err) {
+      console.error(`[queryRewrite] Fout bij ophalen policies voor rol '${userRole}':`, err.message);
+      // Deny-by-default: als we policies niet kunnen verifiëren, weigeren we toegang
+      throw new Error(`[Security Error] Kan beveiligingsbeleid voor rol '${userRole}' niet verifiëren.`);
+    }
+
+    // Identificeer welke cubes en velden in de query worden geraakt
+    const requestedMeasures = query.measures || [];
+    const requestedDimensions = query.dimensions || [];
+    const requestedSegments = query.segments || [];
+    const filterMembers = (query.filters || []).map(f => f.member || '');
+    const timeDimensionMembers = (query.timeDimensions || []).map(td => td.dimension || '');
+
+    const allQueryMembers = [
+      ...requestedMeasures,
+      ...requestedDimensions,
+      ...requestedSegments,
+      ...filterMembers,
+      ...timeDimensionMembers,
+    ];
+
+    const touchedCubes = new Set(
+      allQueryMembers.map(m => m.split('.')[0]).filter(Boolean)
+    );
+
+    // 1. OBJECT-LEVEL SECURITY (OLS) HANDHAVING:
+    // Blokkeert maatstaven of dimensies op basis van rol
+    for (const policy of policies) {
+      if (policy.policy_type === 'OLS') {
+        const def = policy.definition || {};
+        const denyMeasures = def.denyMeasures || [];
+        const denyDimensions = def.denyDimensions || [];
+
+        // Controleer verboden maatstaven
+        for (const denied of denyMeasures) {
+          if (requestedMeasures.includes(denied)) {
+            throw new Error(
+              `[Access Denied] Maatstaf '${denied}' is afgeschermd (Object-Level Security) en niet toegankelijk voor rol '${userRole}'.`
+            );
+          }
+        }
+
+        // Controleer verboden dimensies
+        for (const denied of denyDimensions) {
+          if (requestedDimensions.includes(denied)) {
+            throw new Error(
+              `[Access Denied] Dimensie '${denied}' is afgeschermd (Object-Level Security) en niet toegankelijk voor rol '${userRole}'.`
+            );
+          }
         }
       }
     }
 
-    // B. Row-Level Security (RLS): Data dynamisch filteren op rijniveau
-    const allQueryMembers = [
-      ...(query.measures || []),
-      ...(query.dimensions || []),
-      ...(query.segments || []),
-      ...((query.filters || []).map(f => f.member || ''))
-    ];
-    const touchesOrdersOrUsers = allQueryMembers.some(m => m.startsWith('Orders.') || m.startsWith('Users.'));
+    // 2. ROW-LEVEL SECURITY (RLS) HANDHAVING:
+    // Past dynamisch rijfilters toe op basis van claims of vaste waarden
+    for (const policy of policies) {
+      if (policy.policy_type === 'RLS') {
+        const targetCube = policy.cube_name;
+        // Geldt voor alle cubes ('*') of wanneer de specifieke cube in de query voorkomt
+        if (targetCube === '*' || touchedCubes.has(targetCube)) {
+          const def = policy.definition || {};
+          const member = def.member;
+          const operator = def.operator || 'equals';
 
-    if (touchesOrdersOrUsers && securityContext.city) {
-      query.filters = query.filters || [];
-      query.filters.push({
-        member: 'Users.city',
-        operator: 'equals',
-        values: [securityContext.city]
-      });
-      console.log(`[queryRewrite] RLS filter geactiveerd: Users.city = '${securityContext.city}'`);
+          if (!member) continue;
+
+          // A. Claim-gebaseerde RLS: bijv. claimField: "city"
+          if (def.claimField) {
+            const claimVal = userClaims[def.claimField];
+            // Deny-by-default: als de vereiste claim ontbreekt, weiger direct toegang
+            if (claimVal === undefined || claimVal === null || claimVal === '') {
+              throw new Error(
+                `[Access Denied] Toegang geweigerd: vereiste beveiligingsclaim '${def.claimField}' ontbreekt voor gebruiker '${username}'.`
+              );
+            }
+
+            query.filters = query.filters || [];
+            const values = Array.isArray(claimVal) ? claimVal.map(String) : [String(claimVal)];
+            query.filters.push({
+              member,
+              operator,
+              values,
+            });
+            console.log(`[queryRewrite] RLS claim filter geactiveerd: ${member} ${operator} [${values.join(', ')}]`);
+          }
+          // B. Fixed-value RLS: bijv. fixedValue: "Netherlands"
+          else if (def.fixedValue !== undefined && def.fixedValue !== null) {
+            query.filters = query.filters || [];
+            const values = Array.isArray(def.fixedValue) ? def.fixedValue.map(String) : [String(def.fixedValue)];
+            query.filters.push({
+              member,
+              operator,
+              values,
+            });
+            console.log(`[queryRewrite] RLS fixed filter geactiveerd: ${member} ${operator} [${values.join(', ')}]`);
+          }
+        }
+      }
     }
 
     return query;

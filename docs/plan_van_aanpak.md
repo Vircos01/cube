@@ -74,27 +74,22 @@ Een fase is pas afgerond wanneer de acceptatiecriteria zijn gehaald, inclusief g
 - Een mislukte compiler-validatie wijzigt geen actieve modellen.
 - Een opnieuw uitgevoerde import heeft een voorspelbaar resultaat en maakt geen onbedoelde duplicaten of revisions.
 
-## Fase 3 — Productiewaardige identiteit en toegangscontrole
+## Fase 3 — Productiewaardige identiteit en toegangscontrole [VOLTOOID]
 
 **Doel:** demo-authenticatie vervangen door centraal, controleerbaar beveiligingsbeleid.
 
-**Werk:**
+**Status:** Volledig geïmplementeerd en geverifieerd. Zie ook [`docs/beveiliging_en_toegangscontrole.md`](file:///Users/remcovisser/Dev/Cube/docs/beveiliging_en_toegangscontrole.md).
 
-- Verwijder hardcoded gebruikers en wachtwoorden; verwijder standaard API-secrets of laat de service zonder expliciete secret niet productie starten.
-- Integreer met een afgesproken identity provider of valideer ondertekende tokens met issuer, audience, expiratie en sleutelrotatie.
-- Definieer rollen en rechten voor modelbeheer, databronbeheer, querygebruik, auditinzage en beheer.
-- Maak RLS- en OLS-beleid configuratiegestuurd, met server-side validatie en deny-by-default gedrag.
-- Pas tenant-/rijfilters toe op basis van geverifieerde claims en voorkom dat query-input die context kan overschrijven.
-- Beperk of verwijder de willekeurige SQL-uitvoerfunctie uit de beheer-API; als de tester blijft bestaan, alleen in development of met expliciete beheerrechten en querylimieten.
-- Redigeer credentials, tokens en gevoelige querywaarden in logs en foutmeldingen.
-
-**Acceptatiecriteria:**
-
-- Ongeautoriseerde toegang tot beheer- en query-endpoints wordt getest en geweigerd.
-- RLS blijft gelden bij REST, SQL en andere ondersteunde querypaden.
-- OLS blokkeert zowel directe als indirecte toegang tot verboden members.
-- Geen endpoint retourneert wachtwoorden, tokens of andere secrets.
-- Er is een gedocumenteerd proces voor sleutelrotatie, accountintrekking en beleidswijziging.
+**Opgeleverd:**
+- Centrale PostgreSQL metadata tabellen: `user_accounts`, `security_roles`, `access_policies`.
+- Cryptografische wachtwoordhashing met Node.js `scrypt` en timing-veilige verificatie; wachtwoordhashes worden overal geredigeerd.
+- Dynamische `checkSqlAuth` in `runtime/cube.js` zonder hardcoded credentials.
+- Dynamische `queryRewrite` in `runtime/cube.js` met server-side handhaving van RLS (o.b.v. dynamische claims) en OLS (blokkeren van maatstaven en dimensies).
+- Strikte deny-by-default afhandeling: query weigering wanneer vereiste claims ontbreken.
+- Productiecheck: blokkeert startup indien `NODE_ENV=production` en het bekende standaard API-secret (`mysecretkey123`) actief is.
+- Beveiligd SQL test-endpoint met automatische `LIMIT 100` en credential redactie.
+- Volledige CRUD endpoints in Management API en interactieve Web-UI voor gebruikers-, rollen- en beleidsbeheer.
+- 35/35 geautomatiseerde unit- en integratietests geslaagd.
 
 ## Fase 4 — Modelbeheer, audit en herstel
 

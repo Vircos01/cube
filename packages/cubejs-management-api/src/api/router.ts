@@ -30,8 +30,31 @@ import {
 import { createAuthMiddleware, AuthenticatedRequest } from './auth';
 import { importModelsFromDirectory, exportModelsToDirectory } from '../repository/fileMigrator';
 import { GitService } from '../git/gitService';
+import {
+  getUserByUsername,
+  listUsers,
+  upsertUser,
+  deleteUser,
+  listRoles,
+  upsertRole,
+  listPolicies,
+  upsertPolicy,
+  deletePolicy,
+} from '../repository/securityStore';
+import { verifyPassword } from '../security/password';
 
 export function createManagementRouter(pool: Pool, options: { apiSecret?: string; gitService?: GitService } = {}): Router {
+  // Production Secret Safety Check (Fase 3: Eis 83)
+  // Voorkom dat de service in productie start met de bekende standaardsecret 'mysecretkey123'
+  if (process.env.NODE_ENV === 'production') {
+    const activeSecret = options.apiSecret || process.env.CUBEJS_API_SECRET;
+    if (!activeSecret || activeSecret === 'mysecretkey123') {
+      throw new Error(
+        '[Security Configuration Error] Productie-omgeving gedetecteerd (NODE_ENV=production), maar er is geen veilige CUBEJS_API_SECRET ingesteld of het standaard wachtwoord "mysecretkey123" is nog actief. De service weigert te starten.'
+      );
+    }
+  }
+
   const router = Router();
   const auth = createAuthMiddleware(options.apiSecret);
   const git = options.gitService || new GitService();
@@ -702,62 +725,181 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
 
   // ==========================================
   // SECURITY & ACCESS CONTROL (SSAS / RBAC)
+  // Dynamische Identiteit, Rollen & RLS/OLS Beleid
   // ==========================================
 
-  // GET /security/roles - List configured RBAC roles and policies
-  router.get('/security/roles', async (req, res) => {
-    res.json({
-      sqlApiEndpoint: {
-        host: 'localhost',
-        port: parseInt(process.env.CUBEJS_PG_SQL_PORT || '15432', 10),
-        database: process.env.CUBEJS_DB_NAME || 'cubedb',
-        protocol: 'PostgreSQL Wire Protocol v3 (Superset, PowerBI, Tableau, psql)'
-      },
-      roles: [
-        {
-          username: 'admin',
-          password: 'admin',
-          name: 'Global Administrator',
-          role: 'admin',
-          description: 'Volledige ongefilterde toegang tot alle data, alle rijen en alle maatstaven.',
-          rlsPolicy: 'Geen beperkingen (ziet alle orders en gebruikers wereldwijd)',
-          olsPolicy: 'Alle maatstaven toegestaan (count, total_amount, avg_order_value)',
-          expectedRows: 7
+  // GET /security/users - List active user accounts (passwords redacted)
+  router.get('/security/users', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const users = await listUsers(pool);
+      res.json({ users });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /security/users - Create or update user account
+  router.post('/security/users', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { username, password, display_name, email, role_id, claims, is_active } = req.body;
+      if (!username || !display_name || !role_id) {
+        res.status(400).json({ error: 'Fields "username", "display_name", and "role_id" are required' });
+        return;
+      }
+      const user = await upsertUser(pool, {
+        username,
+        password,
+        display_name,
+        email,
+        role_id,
+        claims: claims || {},
+        is_active,
+      });
+      res.json({ success: true, user });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // DELETE /security/users/:id - Soft-delete user account
+  router.delete('/security/users/:id', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const success = await deleteUser(pool, req.params.id);
+      if (!success) {
+        res.status(404).json({ error: `User ${req.params.id} not found` });
+        return;
+      }
+      res.json({ success: true, id: req.params.id });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /security/roles - List configured RBAC roles and policies from database
+  router.get('/security/roles', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const roles = await listRoles(pool);
+      res.json({
+        sqlApiEndpoint: {
+          host: 'localhost',
+          port: parseInt(process.env.CUBEJS_PG_SQL_PORT || '15432', 10),
+          database: process.env.CUBEJS_DB_NAME || 'cubedb',
+          protocol: 'PostgreSQL Wire Protocol v3 (Superset, PowerBI, Tableau, psql)'
         },
-        {
-          username: 'sales_amsterdam',
-          password: 'amsterdam123',
-          name: 'Sales Rep Amsterdam',
-          role: 'sales_rep',
-          description: 'Toegewezen aan regio Amsterdam. Automatische dynamische Row-Level Security.',
-          rlsPolicy: 'Users.city = "Amsterdam" (ziet uitsluitend orders 1 & 2 van Amsterdamse klanten)',
-          olsPolicy: 'Maatstaf "Orders.avg_order_value" afgeschermd (Access Denied bij opvragen)',
-          expectedRows: 2
-        },
-        {
-          username: 'sales_rotterdam',
-          password: 'rotterdam123',
-          name: 'Sales Rep Rotterdam',
-          role: 'sales_rep',
-          description: 'Toegewezen aan regio Rotterdam. Automatische dynamische Row-Level Security.',
-          rlsPolicy: 'Users.city = "Rotterdam" (ziet uitsluitend orders 3 & 6 van Rotterdamse klanten)',
-          olsPolicy: 'Standaard sales maatstaven (count, total_amount) toegestaan',
-          expectedRows: 2
-        }
-      ]
-    });
+        roles,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /security/roles - Create or update role definition
+  router.post('/security/roles', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { name, display_name, description, is_admin, can_manage_models, can_manage_datasources } = req.body;
+      if (!name || !display_name) {
+        res.status(400).json({ error: 'Fields "name" and "display_name" are required' });
+        return;
+      }
+      const role = await upsertRole(pool, {
+        name,
+        display_name,
+        description,
+        is_admin,
+        can_manage_models,
+        can_manage_datasources,
+      });
+      res.json({ success: true, role });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /security/policies - List active RLS and OLS policies
+  router.get('/security/policies', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const roleId = req.query.roleId as string | undefined;
+      const policies = await listPolicies(pool, roleId);
+      res.json({ policies });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /security/policies - Create or update policy
+  router.post('/security/policies', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id, role_id, cube_name, policy_type, definition } = req.body;
+      if (!role_id || !cube_name || !policy_type || !definition) {
+        res.status(400).json({ error: 'Fields "role_id", "cube_name", "policy_type", and "definition" are required' });
+        return;
+      }
+      if (policy_type !== 'RLS' && policy_type !== 'OLS') {
+        res.status(400).json({ error: 'Field "policy_type" must be either "RLS" or "OLS"' });
+        return;
+      }
+      const policy = await upsertPolicy(pool, {
+        id,
+        role_id,
+        cube_name,
+        policy_type,
+        definition,
+      });
+      res.json({ success: true, policy });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // DELETE /security/policies/:id - Delete policy
+  router.delete('/security/policies/:id', async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const success = await deletePolicy(pool, req.params.id);
+      if (!success) {
+        res.status(404).json({ error: `Policy ${req.params.id} not found` });
+        return;
+      }
+      res.json({ success: true, id: req.params.id });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // POST /security/test-sql - Execute SQL query against Cube SQL API as a specific role
-  router.post('/security/test-sql', async (req, res) => {
+  // Veiligheidsmaatregelen: server-side authenticatie, LIMIT 100 afgedwongen, credentials geredigeerd
+  router.post('/security/test-sql', async (req: AuthenticatedRequest, res: Response) => {
+    // In productie: vereist expliciete admin-rechten
+    if (process.env.NODE_ENV === 'production' && !req.user?.isAdmin) {
+      res.status(403).json({ error: 'SQL Testing endpoint is uitgeschakeld in productie zonder expliciete beheerrechten' });
+      return;
+    }
+
     const { username, password, sql } = req.body;
     if (!username || !password || !sql) {
       res.status(400).json({ error: 'Fields "username", "password" and "sql" are required' });
       return;
     }
 
+    // 1. Verifieer de gebruiker tegen de centrale user_accounts tabel
+    const user = await getUserByUsername(pool, username);
+    if (!user) {
+      res.status(401).json({ success: false, user: username, error: `Gebruiker '${username}' bestaat niet of is inactief.` });
+      return;
+    }
+
+    if (!user.password_hash || !verifyPassword(password, user.password_hash)) {
+      res.status(401).json({ success: false, user: username, error: `Ongeldig wachtwoord voor gebruiker '${username}'.` });
+      return;
+    }
+
+    // 2. Beperk query met automatische LIMIT 100 voor veiligheid
+    let sanitizedSql = sql.trim().replace(/;+$/, '');
+    if (!/\blimit\s+\d+/i.test(sanitizedSql)) {
+      sanitizedSql += ' LIMIT 100';
+    }
+
     const pgPort = parseInt(process.env.CUBEJS_PG_SQL_PORT || '15432', 10);
-    // In Docker, cube runs inside the same container or host
+    // In Docker draait Cube binnen dezelfde container of op localhost
     const client = new Client({
       host: '127.0.0.1',
       port: pgPort,
@@ -770,7 +912,7 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
     try {
       await client.connect();
       const startTime = Date.now();
-      const result = await client.query(sql);
+      const result = await client.query(sanitizedSql);
       const durationMs = Date.now() - startTime;
 
       res.json({
@@ -782,10 +924,14 @@ export function createManagementRouter(pool: Pool, options: { apiSecret?: string
         fields: (result.fields || []).map((f: any) => f.name)
       });
     } catch (err: any) {
+      // Redigeer wachtwoorden en gevoelige strings uit foutmeldingen
+      const sanitizedMsg = (err.message || '')
+        .replace(/password=\S+/gi, 'password=***')
+        .replace(/:\/\/[^@]+@/, '://***@');
       res.status(400).json({
         success: false,
         user: username,
-        error: err.message
+        error: sanitizedMsg
       });
     } finally {
       await client.end().catch(() => {});

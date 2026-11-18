@@ -20,4 +20,10 @@ export async function runMigrations(pool: Pool, options: { includeSampleData?: b
       await pool.query(sampleDataSql);
     }
   }
+
+  const securityRolesPath = path.join(sqlDir, '004_security_roles.sql');
+  if (await fs.pathExists(securityRolesPath)) {
+    const securityRolesSql = await fs.readFile(securityRolesPath, 'utf8');
+    await pool.query(securityRolesSql);
+  }
 }
