@@ -361,10 +361,6 @@
           setGeneratingBatch(false);
         }
       };
-        } catch (e) {
-          notify(`Error: ${e.message}`, 'error');
-        }
-      };
 
       // Run test query against Cube REST API
       const handleRunQuery = async () => {
@@ -798,7 +794,7 @@
                 <div className="flex space-x-1">
                   {[
                     { id: 'editor', label: 'Visual & YAML Split-View' },
-                    { id: 'introspect', label: '🔌 Data Sources & Playground' },
+                    { id: 'introspect', label: '🔌 Data Sources & Tabellen' },
                     { id: 'security', label: '🔐 Access Control (SSAS)' },
                     { id: 'git', label: '🌿 Git & Version Control' },
                     { id: 'revisions', label: 'DB Revisions & Rollback' },
@@ -1709,7 +1705,7 @@
                       <span className="text-2xl">🔌</span>
                       <div>
                         <h2 className="text-base font-bold text-slate-100">
-                          Data Sources & Schema Playground
+                          Data Sources & Schema Explorer
                         </h2>
                         <p className="text-xs text-slate-400">
                           Geef een brondatabase op, inspecteer schema's en tabellen, en neem geselecteerde tabellen automatisch op in VAS als semantische modellen (met dimensies, measures en joins).
