@@ -47,11 +47,13 @@
       const [notification, setNotification] = useState(null);
       
       // Data Source state
+      const [savedDataSources, setSavedDataSources] = useState([]);
+      const [selectedDataSource, setSelectedDataSource] = useState('default'); // 'default' | '<dsName>' | 'new'
       const [dbTables, setDbTables] = useState([]);
       const [loadingIntrospect, setLoadingIntrospect] = useState(false);
+      const [introspectError, setIntrospectError] = useState(null);
       const [selectedTableNames, setSelectedTableNames] = useState([]);
       const [introspectSearch, setIntrospectSearch] = useState('');
-      const [activeSourceMode, setActiveSourceMode] = useState('default'); // 'default' | 'custom'
       const [customConn, setCustomConn] = useState({
         host: 'postgres',
         port: 5432,
@@ -64,10 +66,17 @@
       const [customDsName, setCustomDsName] = useState('remote_dwh');
       const [connTestResult, setConnTestResult] = useState(null);
       const [testingConn, setTestingConn] = useState(false);
+      const [savingDataSource, setSavingDataSource] = useState(false);
       const [autoJoins, setAutoJoins] = useState(true);
       const [autoMeasures, setAutoMeasures] = useState(true);
       const [generatingBatch, setGeneratingBatch] = useState(false);
       const [expandedTables, setExpandedTables] = useState({});
+
+      // Review Modal & Reporting state
+      const [previewModalOpen, setPreviewModalOpen] = useState(false);
+      const [previewData, setPreviewData] = useState(null);
+      const [loadingPreview, setLoadingPreview] = useState(false);
+      const [lastImportReport, setLastImportReport] = useState(null);
 
       // Query tester state
       const [queryJson, setQueryJson] = useState('{\n  "measures": ["Orders.count", "Orders.total_amount"],\n  "dimensions": ["Orders.status"]\n}');
@@ -245,7 +254,20 @@
         }
       };
 
-      // Test custom database connection
+      // Fetch registered data sources
+      const fetchDataSources = async () => {
+        try {
+          const res = await fetch('/management/v1/datasources', { headers: getHeaders() });
+          if (res.ok) {
+            const list = await res.json();
+            setSavedDataSources(list || []);
+          }
+        } catch (e) {
+          console.warn('Failed to fetch data sources:', e.message);
+        }
+      };
+
+      // Test database connection
       const handleTestConnection = async () => {
         setTestingConn(true);
         setConnTestResult(null);
@@ -258,28 +280,73 @@
           const data = await res.json();
           setConnTestResult(data);
           if (data.success) {
-            notify(`✓ Connection successful! (${data.latencyMs}ms)`);
+            notify(`✓ Verbinding geslaagd! (${data.latencyMs}ms)`);
             if (data.schemas && data.schemas.length > 0 && !data.schemas.includes(customConn.schema)) {
               setCustomConn(prev => ({ ...prev, schema: data.schemas[0] }));
             }
           } else {
-            notify(`Connection failed: ${data.error}`, 'error');
+            notify(`Verbinding mislukt: ${data.error}`, 'error');
           }
         } catch (e) {
           setConnTestResult({ success: false, error: e.message });
-          notify(`Connection error: ${e.message}`, 'error');
+          notify(`Verbindingsfout: ${e.message}`, 'error');
         } finally {
           setTestingConn(false);
         }
       };
 
-      // Introspect DB (Default or Custom DB)
-      const loadIntrospect = async (mode = activeSourceMode) => {
-        setLoadingIntrospect(true);
+      // Save custom data source permanently
+      const handleSaveDataSource = async () => {
+        if (!customDsName || !customConn.host || !customConn.database) {
+          notify('Vul minimaal Data Source ID, Host en Database in.', 'error');
+          return;
+        }
+        setSavingDataSource(true);
         try {
-          const payload = mode === 'custom'
-            ? { connection: customConn, schema: customConn.schema }
-            : { schema: 'public' };
+          const res = await fetch('/management/v1/datasources', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({
+              name: customDsName,
+              db_type: 'postgres',
+              host: customConn.host,
+              port: customConn.port,
+              database_name: customConn.database,
+              username: customConn.user,
+              password: customConn.password,
+              schema_name: customConn.schema,
+              ssl: customConn.ssl
+            })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            notify(`✓ Databron '${customDsName}' opgeslagen!`);
+            await fetchDataSources();
+            setSelectedDataSource(customDsName);
+            loadIntrospect(customDsName);
+          } else {
+            notify(`Opslaan mislukt: ${data.error}`, 'error');
+          }
+        } catch (e) {
+          notify(`Fout bij opslaan: ${e.message}`, 'error');
+        } finally {
+          setSavingDataSource(false);
+        }
+      };
+
+      // Introspect DB (Default, Saved Data Source, or Custom form)
+      const loadIntrospect = async (targetDs = selectedDataSource) => {
+        setLoadingIntrospect(true);
+        setIntrospectError(null);
+        try {
+          let payload;
+          if (targetDs === 'default') {
+            payload = { schema: 'public' };
+          } else if (targetDs === 'new') {
+            payload = { connection: customConn, schema: customConn.schema };
+          } else {
+            payload = { dataSource: targetDs, schema: customConn.schema || 'public' };
+          }
 
           const res = await fetch('/management/v1/datasources/introspect', {
             method: 'POST',
@@ -287,32 +354,80 @@
             body: JSON.stringify(payload)
           });
           const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data.error || 'Fout bij introspectie van tabellen');
+          }
           const tables = data.tables || [];
           setDbTables(tables);
-          setSelectedTableNames(tables.map(t => `${t.schema}.${t.name}`));
+          setSelectedTableNames([]); // Bewuste selectie conform plan
+          setIntrospectError(null);
         } catch (e) {
-          notify(`Introspection failed: ${e.message}`, 'error');
+          setDbTables([]);
+          setSelectedTableNames([]);
+          setIntrospectError(e.message);
+          notify(`Introspectie mislukt: ${e.message}`, 'error');
         } finally {
           setLoadingIntrospect(false);
         }
       };
 
-      // Batch generate selected tables into VAS
-      const handleBatchGenerate = async () => {
-        const selected = dbTables.filter(t => selectedTableNames.includes(`${t.schema}.${t.name}`));
+      // Open Review Modal vóór definitieve batch import
+      const handleOpenReviewModal = async (singleTable = null) => {
+        const selected = singleTable ? [singleTable] : dbTables.filter(t => selectedTableNames.includes(`${t.schema}.${t.name}`));
         if (selected.length === 0) {
-          notify('Select at least one table to import', 'error');
+          notify('Selecteer minstens één tabel om te importeren', 'error');
           return;
         }
 
-        setGeneratingBatch(true);
+        setLoadingPreview(true);
         try {
-          const isCustom = activeSourceMode === 'custom';
+          const isNew = selectedDataSource === 'new';
           const payload = {
             tables: selected,
             options: { autoJoins, autoMeasures },
-            connection: isCustom ? customConn : undefined,
-            dataSourceName: isCustom ? (customDsName || 'remote_dwh') : undefined,
+            connection: isNew ? customConn : undefined,
+            dataSourceName: isNew ? customDsName : (selectedDataSource !== 'default' ? selectedDataSource : undefined),
+            dataSource: selectedDataSource !== 'new' && selectedDataSource !== 'default' ? selectedDataSource : undefined,
+          };
+
+          const res = await fetch('/management/v1/datasources/preview-import', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json();
+          if (res.ok) {
+            setPreviewData(data);
+            setPreviewModalOpen(true);
+          } else {
+            notify(`Preview mislukt: ${data.error}`, 'error');
+          }
+        } catch (e) {
+          notify(`Fout bij preview: ${e.message}`, 'error');
+        } finally {
+          setLoadingPreview(false);
+        }
+      };
+
+      // Execute atomic batch import after review confirmation
+      const handleExecuteBatchImport = async () => {
+        if (!previewData || !previewData.items || previewData.items.length === 0) return;
+        const targetTables = dbTables.filter(t => previewData.items.some(p => p.table === `${t.schema}.${t.name}`));
+
+        setGeneratingBatch(true);
+        try {
+          const isNew = selectedDataSource === 'new';
+          const payload = {
+            tables: targetTables.length > 0 ? targetTables : previewData.items.map(p => ({
+              schema: p.table.split('.')[0] || 'public',
+              name: p.table.split('.')[1] || p.table,
+              columns: [],
+              foreignKeys: []
+            })),
+            options: { autoJoins, autoMeasures },
+            connection: isNew ? customConn : undefined,
+            dataSourceName: isNew ? customDsName : (selectedDataSource !== 'default' ? selectedDataSource : undefined),
+            dataSource: selectedDataSource !== 'new' && selectedDataSource !== 'default' ? selectedDataSource : undefined,
           };
 
           const res = await fetch('/management/v1/datasources/generate-cubes', {
@@ -322,56 +437,22 @@
           });
           const data = await res.json();
           if (res.ok) {
+            setPreviewModalOpen(false);
+            setLastImportReport(data);
             const dsLabel = data.dataSource !== 'default' ? ` (Data source: ${data.dataSource})` : '';
-            notify(`✓ Successfully generated & atomically imported ${data.count} models into VAS${dsLabel}!`);
+            notify(`✓ Succesvol ${data.count} modellen atomair geïmporteerd in VAS${dsLabel}!`);
             fetchHealth();
             await fetchModels();
+            fetchDataSources();
             if (data.imported && data.imported.length > 0) {
               selectModel(data.imported[0].model.id);
             }
-            setActiveTab('editor');
           } else {
             const validationDetails = data.validationErrors ? ': ' + data.validationErrors.map(e => e.message).join('; ') : '';
-            notify(`Import failed: ${data.error}${validationDetails}`, 'error');
+            notify(`Import mislukt: ${data.error}${validationDetails}`, 'error');
           }
         } catch (e) {
           notify(`Import error: ${e.message}`, 'error');
-        } finally {
-          setGeneratingBatch(false);
-        }
-      };
-
-      // Generate single Cube from introspected table
-      const generateCubeFromTable = async (table) => {
-        setGeneratingBatch(true);
-        try {
-          const isCustom = activeSourceMode === 'custom';
-          const payload = {
-            tables: [table],
-            options: { autoJoins, autoMeasures },
-            connection: isCustom ? customConn : undefined,
-            dataSourceName: isCustom ? (customDsName || 'remote_dwh') : undefined,
-          };
-
-          const res = await fetch('/management/v1/datasources/generate-cubes', {
-            method: 'POST',
-            headers: getHeaders(),
-            body: JSON.stringify(payload)
-          });
-          const data = await res.json();
-          if (res.ok && data.imported && data.imported.length > 0) {
-            const dsLabel = data.dataSource !== 'default' ? ` (Data source: ${data.dataSource})` : '';
-            notify(`✓ Cube ${data.imported[0].cubeName} generated from table ${table.name}${dsLabel}!`);
-            fetchHealth();
-            await fetchModels();
-            selectModel(data.imported[0].model.id);
-            setActiveTab('editor');
-          } else {
-            const validationDetails = data.validationErrors ? ': ' + data.validationErrors.map(e => e.message).join('; ') : '';
-            notify(`Failed: ${data.error}${validationDetails}`, 'error');
-          }
-        } catch (e) {
-          notify(`Error: ${e.message}`, 'error');
         } finally {
           setGeneratingBatch(false);
         }
@@ -586,7 +667,8 @@
       useEffect(() => {
         fetchHealth();
         fetchModels();
-        loadIntrospect();
+        fetchDataSources();
+        loadIntrospect('default');
         fetchGitStatus();
         fetchGitBranches();
         fetchGitLog();
@@ -1715,66 +1797,151 @@
               {activeTab === 'introspect' && (
                 <div className="flex-1 overflow-y-auto p-6 space-y-6">
                   {/* Top Header Banner */}
-                  <div className="bg-gradient-to-r from-slate-900 via-indigo-950/40 to-slate-900 border border-slate-800 p-5 rounded-xl flex items-center justify-between">
-                    <div className="flex items-center space-x-3">
-                      <span className="text-2xl">🔌</span>
-                      <div>
-                        <h2 className="text-base font-bold text-slate-100">
-                          Data Sources & Schema Explorer
-                        </h2>
-                        <p className="text-xs text-slate-400">
-                          Geef een brondatabase op, inspecteer schema's en tabellen, en neem geselecteerde tabellen automatisch op in VAS als semantische modellen (met dimensies, measures en joins).
-                        </p>
+                  {/* Top Header Banner & Data Source Selector */}
+                  <div className="bg-gradient-to-r from-slate-900 via-indigo-950/40 to-slate-900 border border-slate-800 p-5 rounded-xl space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center space-x-3">
+                        <span className="text-2xl">🔌</span>
+                        <div>
+                          <h2 className="text-base font-bold text-slate-100">
+                            Data Sources & Schema Explorer
+                          </h2>
+                          <p className="text-xs text-slate-400">
+                            Beheer databronnen, inspecteer tabellen en neem ze via een veilige review- en validatiestap atomair op in VAS.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Active Status Badge */}
+                      <div className="text-xs px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 flex items-center space-x-2">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                        <span className="text-slate-400">Actieve Bron:</span>
+                        <span className="font-mono font-bold text-indigo-300">
+                          {selectedDataSource === 'default' ? 'Default VAS Database' : selectedDataSource === 'new' ? 'Nieuwe Externe Bron' : selectedDataSource}
+                        </span>
                       </div>
                     </div>
 
-                    {/* Source Mode Toggle */}
-                    <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800 space-x-1 text-xs">
+                    {/* Data Source Selector Pills */}
+                    <div className="flex items-center space-x-2 pt-1 border-t border-slate-800/80 overflow-x-auto text-xs">
+                      <span className="text-slate-500 font-medium whitespace-nowrap">Kies Databron:</span>
+                      
                       <button
                         onClick={() => {
-                          setActiveSourceMode('default');
+                          setSelectedDataSource('default');
                           loadIntrospect('default');
                         }}
-                        className={`px-3 py-1.5 rounded-md font-medium transition-colors ${
-                          activeSourceMode === 'default'
+                        className={`px-3 py-1.5 rounded-lg font-medium whitespace-nowrap transition-colors flex items-center space-x-1.5 ${
+                          selectedDataSource === 'default'
                             ? 'bg-indigo-600 text-white shadow'
-                            : 'text-slate-400 hover:text-slate-200'
+                            : 'bg-slate-950 text-slate-400 hover:text-slate-200 border border-slate-800'
                         }`}
                       >
-                        Default VAS Database
+                        <span>🏠 Default VAS DB</span>
                       </button>
+
+                      {savedDataSources.map(ds => (
+                        <button
+                          key={ds.id}
+                          onClick={() => {
+                            setSelectedDataSource(ds.name);
+                            loadIntrospect(ds.name);
+                          }}
+                          className={`px-3 py-1.5 rounded-lg font-medium whitespace-nowrap transition-colors flex items-center space-x-1.5 ${
+                            selectedDataSource === ds.name
+                              ? 'bg-indigo-600 text-white shadow'
+                              : 'bg-slate-950 text-slate-400 hover:text-slate-200 border border-slate-800'
+                          }`}
+                        >
+                          <span>🗄️ {ds.name}</span>
+                          <span className="text-[10px] opacity-75 font-mono">({ds.database_name})</span>
+                        </button>
+                      ))}
+
                       <button
-                        onClick={() => setActiveSourceMode('custom')}
-                        className={`px-3 py-1.5 rounded-md font-medium transition-colors ${
-                          activeSourceMode === 'custom'
+                        onClick={() => {
+                          setSelectedDataSource('new');
+                          setConnTestResult(null);
+                        }}
+                        className={`px-3 py-1.5 rounded-lg font-medium whitespace-nowrap transition-colors flex items-center space-x-1 ${
+                          selectedDataSource === 'new'
                             ? 'bg-indigo-600 text-white shadow'
-                            : 'text-slate-400 hover:text-slate-200'
+                            : 'bg-slate-950 text-slate-400 hover:text-slate-200 border border-dashed border-slate-700'
                         }`}
                       >
-                        Custom / Externe Database
+                        <span>+ Nieuwe Externe Bron</span>
                       </button>
                     </div>
                   </div>
 
-                  {/* Custom Database Configurator (if activeSourceMode === 'custom') */}
-                  {activeSourceMode === 'custom' && (
+                  {/* Persistent Last Import Report Banner if present */}
+                  {lastImportReport && (
+                    <div className="bg-emerald-950/40 border border-emerald-800 p-4 rounded-xl flex items-center justify-between text-xs text-emerald-200">
+                      <div className="flex items-center space-x-3">
+                        <span className="text-xl">✓</span>
+                        <div>
+                          <span className="font-bold">Atomaire Batch Import Voltooid:</span> {lastImportReport.count} modellen succesvol gepubliceerd (Data Source: <span className="font-mono">{lastImportReport.dataSource}</span>).
+                          <div className="text-[11px] text-emerald-300/80 mt-0.5">
+                            Modellen zijn direct live beschikbaar in de VAS semantische laag en SQL-API.
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => setLastImportReport(null)}
+                        className="text-emerald-400 hover:text-emerald-200 p-1 font-bold"
+                      >
+                        ✕ Sluiten
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Inline Error Alert if Introspection Failed */}
+                  {introspectError && (
+                    <div className="bg-rose-950/50 border border-rose-800 p-4 rounded-xl flex items-center justify-between text-xs text-rose-200">
+                      <div className="flex items-center space-x-3">
+                        <span className="text-xl">⚠️</span>
+                        <div>
+                          <span className="font-bold">Introspectie Fout:</span> {introspectError}
+                          <div className="text-[11px] text-rose-300/80 mt-0.5">
+                            Controleer de databasenaam, gebruikersnaam, host en netwerktoegang en probeer opnieuw.
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => loadIntrospect()}
+                        className="px-3 py-1.5 bg-rose-800 hover:bg-rose-700 text-white rounded-lg font-medium"
+                      >
+                        🔄 Opnieuw Proberen
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Custom Database Configurator (if selectedDataSource === 'new') */}
+                  {selectedDataSource === 'new' && (
                     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
                       <div className="flex items-center justify-between border-b border-slate-800 pb-3">
                         <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
-                          ⚙️ Externe Database Verbinding Instellen
+                          ⚙️ Nieuwe Externe Database Verbinding Configureren
                         </span>
                         <div className="flex items-center space-x-2">
                           <button
                             onClick={handleTestConnection}
                             disabled={testingConn}
-                            className="text-xs px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-indigo-300 border border-slate-700 font-medium"
+                            className="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-indigo-300 border border-slate-700 font-medium"
                           >
                             {testingConn ? 'Verbinding testen...' : '🔌 Test Verbinding'}
                           </button>
                           <button
-                            onClick={() => loadIntrospect('custom')}
+                            onClick={handleSaveDataSource}
+                            disabled={savingDataSource}
+                            className="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium shadow"
+                          >
+                            {savingDataSource ? 'Opslaan...' : '💾 Sla Databron Op'}
+                          </button>
+                          <button
+                            onClick={() => loadIntrospect('new')}
                             disabled={loadingIntrospect}
-                            className="text-xs px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-medium"
+                            className="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-medium"
                           >
                             {loadingIntrospect ? 'Ophalen...' : 'Haal Tabellen Op'}
                           </button>
@@ -1788,7 +1955,10 @@
                           <input
                             type="text"
                             value={customConn.host}
-                            onChange={(e) => setCustomConn({ ...customConn, host: e.target.value })}
+                            onChange={(e) => {
+                              setConnTestResult(null);
+                              setCustomConn({ ...customConn, host: e.target.value });
+                            }}
                             className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
                             placeholder="e.g. postgres, localhost, db.company.com"
                           />
@@ -1798,7 +1968,10 @@
                           <input
                             type="number"
                             value={customConn.port}
-                            onChange={(e) => setCustomConn({ ...customConn, port: parseInt(e.target.value, 10) || 5432 })}
+                            onChange={(e) => {
+                              setConnTestResult(null);
+                              setCustomConn({ ...customConn, port: parseInt(e.target.value, 10) || 5432 });
+                            }}
                             className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
                             placeholder="5432"
                           />
@@ -1808,7 +1981,10 @@
                           <input
                             type="text"
                             value={customConn.database}
-                            onChange={(e) => setCustomConn({ ...customConn, database: e.target.value })}
+                            onChange={(e) => {
+                              setConnTestResult(null);
+                              setCustomConn({ ...customConn, database: e.target.value });
+                            }}
                             className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
                             placeholder="cubedb, my_warehouse"
                           />
@@ -1818,7 +1994,10 @@
                           <input
                             type="text"
                             value={customConn.schema}
-                            onChange={(e) => setCustomConn({ ...customConn, schema: e.target.value })}
+                            onChange={(e) => {
+                              setConnTestResult(null);
+                              setCustomConn({ ...customConn, schema: e.target.value });
+                            }}
                             className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
                             placeholder="public"
                           />
@@ -1829,7 +2008,10 @@
                           <input
                             type="text"
                             value={customConn.user}
-                            onChange={(e) => setCustomConn({ ...customConn, user: e.target.value })}
+                            onChange={(e) => {
+                              setConnTestResult(null);
+                              setCustomConn({ ...customConn, user: e.target.value });
+                            }}
                             className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
                             placeholder="postgres"
                           />
@@ -1839,7 +2021,10 @@
                           <input
                             type="password"
                             value={customConn.password}
-                            onChange={(e) => setCustomConn({ ...customConn, password: e.target.value })}
+                            onChange={(e) => {
+                              setConnTestResult(null);
+                              setCustomConn({ ...customConn, password: e.target.value });
+                            }}
                             className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
                             placeholder="••••••••"
                           />
@@ -1849,7 +2034,10 @@
                           <input
                             type="text"
                             value={customDsName}
-                            onChange={(e) => setCustomDsName(e.target.value)}
+                            onChange={(e) => {
+                              setConnTestResult(null);
+                              setCustomDsName(e.target.value);
+                            }}
                             className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
                             placeholder="remote_dwh"
                           />
@@ -1859,7 +2047,10 @@
                             type="checkbox"
                             id="ssl-check"
                             checked={customConn.ssl}
-                            onChange={(e) => setCustomConn({ ...customConn, ssl: e.target.checked })}
+                            onChange={(e) => {
+                              setConnTestResult(null);
+                              setCustomConn({ ...customConn, ssl: e.target.checked });
+                            }}
                             className="rounded bg-slate-950 border-slate-700 text-indigo-600 focus:ring-0"
                           />
                           <label htmlFor="ssl-check" className="text-slate-300 cursor-pointer">SSL inschakelen</label>
@@ -1887,7 +2078,7 @@
                     </div>
                   )}
 
-                  {/* Data Source Toolbar (Search, Filter, Options & Batch Generate Button) */}
+                  {/* Data Source Toolbar (Search, Filter, Options & Review/Generate Button) */}
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
                     <div className="flex items-center space-x-3">
                       {/* Search box */}
@@ -1896,6 +2087,76 @@
                           type="text"
                           value={introspectSearch}
                           onChange={(e) => setIntrospectSearch(e.target.value)}
+                          placeholder="Filter tabellen (bijv. orders, users)..."
+                          className="w-64 bg-slate-950 border border-slate-800 rounded px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                        />
+                      </div>
+
+                      {/* Select All toggle */}
+                      <button
+                        onClick={() => {
+                          const allKeys = dbTables.map(t => `${t.schema}.${t.name}`);
+                          if (selectedTableNames.length === dbTables.length) {
+                            setSelectedTableNames([]);
+                          } else {
+                            setSelectedTableNames(allKeys);
+                          }
+                        }}
+                        className="text-xs px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium"
+                      >
+                        {selectedTableNames.length === dbTables.length ? 'Deselecteer alles' : `Selecteer alles (${dbTables.length})`}
+                      </button>
+
+                      <span className="text-xs text-slate-400 font-mono">
+                        {selectedTableNames.length} van {dbTables.length} geselecteerd
+                      </span>
+
+                      <div className="h-6 border-r border-slate-800"></div>
+
+                      {/* Generation options checkboxes */}
+                      <label className="flex items-center space-x-1.5 text-xs text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={autoJoins}
+                          onChange={(e) => setAutoJoins(e.target.checked)}
+                          className="rounded bg-slate-950 border-slate-700 text-indigo-600"
+                        />
+                        <span>Auto Joins (FK)</span>
+                      </label>
+
+                      <label className="flex items-center space-x-1.5 text-xs text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={autoMeasures}
+                          onChange={(e) => setAutoMeasures(e.target.checked)}
+                          className="rounded bg-slate-950 border-slate-700 text-indigo-600"
+                        />
+                        <span>Auto Measures (Sum/Avg)</span>
+                      </label>
+                    </div>
+
+                    {/* Batch Generate / Review CTA Button */}
+                    <div className="flex items-center space-x-2">
+                      <button
+                        onClick={() => loadIntrospect()}
+                        disabled={loadingIntrospect}
+                        className="text-xs px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium"
+                      >
+                        {loadingIntrospect ? 'Verversen...' : '🔄 Verversen'}
+                      </button>
+
+                      <button
+                        onClick={() => handleOpenReviewModal()}
+                        disabled={loadingPreview || selectedTableNames.length === 0}
+                        className="text-xs px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold shadow disabled:opacity-50 flex items-center space-x-1.5"
+                      >
+                        <span>📋</span>
+                        <span>
+                          {loadingPreview ? 'Analyseren...' : `Review & Importeer (${selectedTableNames.length})`}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
                           placeholder="Filter tabellen (bijv. orders, users)..."
                           className="w-64 bg-slate-950 border border-slate-800 rounded px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
                         />
@@ -2038,10 +2299,10 @@
                                   {isExpanded ? 'Verberg Kolommen ▲' : 'Bekijk Kolommen ▼'}
                                 </button>
                                 <button
-                                  onClick={() => generateCubeFromTable(table)}
+                                  onClick={() => handleOpenReviewModal(table)}
                                   className="text-xs px-3 py-1 bg-indigo-950 hover:bg-indigo-900 text-indigo-300 border border-indigo-700/60 rounded font-medium transition-colors"
                                 >
-                                  {alreadyExists ? 'Hergenereer Cube' : '+ Genereer Cube'}
+                                  {alreadyExists ? 'Review & Update' : '+ Review & Import'}
                                 </button>
                               </div>
                             </div>
@@ -2087,12 +2348,157 @@
                         );
                       })}
 
-                    {dbTables.length === 0 && !loadingIntrospect && (
+                    {dbTables.length === 0 && !loadingIntrospect && !introspectError && (
                       <div className="p-8 text-center text-slate-500 text-xs italic bg-slate-900 rounded-xl border border-slate-800">
-                        Geen tabellen gevonden in het huidige schema. Klik op "Haal Tabellen Op" of controleer de verbindingsgegevens.
+                        Geen tabellen gevonden in het huidige schema. Klik op "Haal Tabellen Op" of kies een andere databron.
                       </div>
                     )}
                   </div>
+
+                  {/* PRE-IMPORT REVIEW & CONFLICTS MODAL */}
+                  {previewModalOpen && previewData && (
+                    <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl max-h-[85vh] flex flex-col shadow-2xl overflow-hidden animate-in fade-in">
+                        {/* Modal Header */}
+                        <div className="p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/50">
+                          <div className="flex items-center space-x-3">
+                            <span className="text-2xl">📋</span>
+                            <div>
+                              <h3 className="text-base font-bold text-slate-100">Review & Conflicten: Model Import in VAS</h3>
+                              <p className="text-xs text-slate-400">
+                                Controleer de gegenereerde cubes, joins en eventuele overschrijvingen vóórdat de atomaire transactie wordt gepubliceerd.
+                              </p>
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => setPreviewModalOpen(false)}
+                            className="text-slate-400 hover:text-slate-200 text-lg p-1"
+                          >
+                            ✕
+                          </button>
+                        </div>
+
+                        {/* Modal Body / Summary Badges */}
+                        <div className="p-5 overflow-y-auto space-y-4 flex-1">
+                          {/* Summary Badges Grid */}
+                          <div className="grid grid-cols-4 gap-3">
+                            <div className="bg-slate-950 border border-slate-800 p-3 rounded-lg text-center">
+                              <span className="text-[11px] text-slate-400 block">Totaal Geselecteerd</span>
+                              <span className="text-lg font-bold text-slate-200">{previewData.summary.total}</span>
+                            </div>
+                            <div className="bg-emerald-950/30 border border-emerald-800/60 p-3 rounded-lg text-center">
+                              <span className="text-[11px] text-emerald-400 block">Nieuwe Cubes</span>
+                              <span className="text-lg font-bold text-emerald-300">+{previewData.summary.toCreate}</span>
+                            </div>
+                            <div className={`p-3 rounded-lg text-center border ${
+                              previewData.summary.toUpdate > 0 
+                                ? 'bg-amber-950/40 border-amber-800 text-amber-200' 
+                                : 'bg-slate-950 border-slate-800 text-slate-400'
+                            }`}>
+                              <span className="text-[11px] block">Overschrijven (Conflict)</span>
+                              <span className="text-lg font-bold">{previewData.summary.toUpdate}</span>
+                            </div>
+                            <div className={`p-3 rounded-lg text-center border ${
+                              previewData.summary.totalSkippedJoins > 0 
+                                ? 'bg-sky-950/40 border-sky-800 text-sky-200' 
+                                : 'bg-slate-950 border-slate-800 text-slate-400'
+                            }`}>
+                              <span className="text-[11px] block">Veilig Overgeslagen Joins</span>
+                              <span className="text-lg font-bold">{previewData.summary.totalSkippedJoins}</span>
+                            </div>
+                          </div>
+
+                          {/* Compiler Validation Banner */}
+                          <div className={`p-3 rounded-lg border text-xs flex items-center justify-between ${
+                            previewData.valid 
+                              ? 'bg-emerald-950/30 border-emerald-800 text-emerald-300' 
+                              : 'bg-rose-950/40 border-rose-800 text-rose-300'
+                          }`}>
+                            <div className="flex items-center space-x-2">
+                              <span>{previewData.valid ? '✓' : '⚠️'}</span>
+                              <span>
+                                {previewData.valid 
+                                  ? 'Virtuele schemacompilatie (@cubejs-backend/schema-compiler) succesvol doorstaan!' 
+                                  : `Compilatiewaarschuwing: ${previewData.validationErrors.map(e => e.message).join('; ')}`}
+                              </span>
+                            </div>
+                            <span className="font-mono text-[11px] text-slate-400">Atomaire Transactie Gereed</span>
+                          </div>
+
+                          {/* Items List */}
+                          <div className="space-y-2">
+                            <span className="text-xs font-semibold uppercase tracking-wider text-slate-400 block">
+                              Te importeren modellen ({previewData.items.length}):
+                            </span>
+                            <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                              {previewData.items.map((item, idx) => (
+                                <div
+                                  key={idx}
+                                  className="bg-slate-950 border border-slate-800 p-3 rounded-xl flex items-center justify-between text-xs font-mono"
+                                >
+                                  <div>
+                                    <div className="flex items-center space-x-2">
+                                      <span className="font-bold text-slate-100">{item.cubeName}</span>
+                                      <span className="text-slate-500 font-sans">({item.table})</span>
+                                      {item.isConflict ? (
+                                        <span className="text-[10px] bg-amber-950/80 text-amber-300 border border-amber-700 px-2 py-0.5 rounded font-sans font-semibold">
+                                          ⚠️ Overschrijft bestaand model
+                                        </span>
+                                      ) : (
+                                        <span className="text-[10px] bg-emerald-950/80 text-emerald-300 border border-emerald-700 px-2 py-0.5 rounded font-sans font-semibold">
+                                          + Nieuw model
+                                        </span>
+                                      )}
+                                      {item.dataSource !== 'default' && (
+                                        <span className="text-[10px] bg-indigo-950 text-indigo-300 border border-indigo-800 px-2 py-0.5 rounded font-sans">
+                                          DB: {item.dataSource}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="text-[11px] text-slate-400 font-sans mt-1 flex items-center space-x-3">
+                                      <span>{item.dimensionsCount} dimensies</span>
+                                      <span>•</span>
+                                      <span>{item.measuresCount} measures</span>
+                                      <span>•</span>
+                                      <span className="text-indigo-400">{item.joinsCount} join(s) gelegd</span>
+                                    </div>
+                                    {item.skippedJoins && item.skippedJoins.length > 0 && (
+                                      <div className="mt-1.5 text-[11px] text-amber-400/90 font-sans bg-amber-950/20 border border-amber-900/30 p-1.5 rounded">
+                                        ⚠️ {item.skippedJoins.join('; ')}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Modal Footer */}
+                        <div className="p-4 border-t border-slate-800 bg-slate-950 flex items-center justify-between">
+                          <button
+                            onClick={() => setPreviewModalOpen(false)}
+                            className="text-xs px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium"
+                          >
+                            Annuleren
+                          </button>
+
+                          <button
+                            onClick={handleExecuteBatchImport}
+                            disabled={generatingBatch || !previewData.valid}
+                            className="text-xs px-5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold shadow disabled:opacity-50 flex items-center space-x-2"
+                          >
+                            <span>🚀</span>
+                            <span>
+                              {generatingBatch 
+                                ? 'Transactie wordt uitgevoerd...' 
+                                : `Bevestig & Importeer Atomaire Batch (${previewData.summary.total} modellen)`}
+                            </span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </main>

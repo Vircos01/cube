@@ -235,17 +235,36 @@ function createManagementRouter(pool, options = {}) {
     const handleIntrospect = async (req, res) => {
         try {
             const schema = req.query.schema || (req.body && req.body.schema) || 'public';
+            const dsIdentifier = req.query.dataSource || (req.body && req.body.dataSource);
             const connection = req.body && req.body.connection;
-            if (connection && (connection.host || connection.database)) {
-                // Use custom connection
-                const client = new pg_1.Client({
+            let connConfig = null;
+            if (dsIdentifier && dsIdentifier !== 'default') {
+                const storedDs = await (0, dataSourceStore_1.getDataSource)(pool, dsIdentifier);
+                if (storedDs) {
+                    connConfig = {
+                        host: storedDs.host,
+                        port: storedDs.port,
+                        user: storedDs.username,
+                        password: storedDs.password,
+                        database: storedDs.database_name,
+                        ssl: storedDs.ssl ? { rejectUnauthorized: false } : false,
+                    };
+                }
+            }
+            else if (connection && (connection.host || connection.database)) {
+                connConfig = {
                     host: connection.host || process.env.CUBEJS_DB_HOST || 'localhost',
                     port: connection.port || parseInt(process.env.CUBEJS_DB_PORT || '5432', 10),
                     user: connection.user || process.env.CUBEJS_DB_USER || 'postgres',
                     password: connection.password || process.env.CUBEJS_DB_PASS || 'postgres',
                     database: connection.database || process.env.CUBEJS_DB_NAME || 'cubedb',
                     ssl: connection.ssl ? { rejectUnauthorized: false } : false,
-                    connectionTimeoutMillis: 5000
+                };
+            }
+            if (connConfig) {
+                const client = new pg_1.Client({
+                    ...connConfig,
+                    connectionTimeoutMillis: 5000,
                 });
                 try {
                     await client.connect();
@@ -268,7 +287,7 @@ function createManagementRouter(pool, options = {}) {
     };
     router.get('/datasources/introspect', handleIntrospect);
     router.post('/datasources/introspect', handleIntrospect);
-    // GET /datasources - List all registered external data sources
+    // GET /datasources - List all registered external data sources (passwords redacted)
     router.get('/datasources', async (req, res) => {
         try {
             const dataSources = await (0, dataSourceStore_1.listDataSources)(pool);
@@ -278,18 +297,159 @@ function createManagementRouter(pool, options = {}) {
             res.status(500).json({ error: err.message });
         }
     });
+    // POST /datasources - Create or update a data source
+    router.post('/datasources', async (req, res) => {
+        try {
+            const { name, db_type, host, port, database_name, username, password, schema_name, ssl } = req.body;
+            if (!name || !host || !database_name || !username) {
+                res.status(400).json({ error: 'Fields "name", "host", "database_name", and "username" are required.' });
+                return;
+            }
+            const ds = await (0, dataSourceStore_1.upsertDataSource)(pool, {
+                name,
+                db_type,
+                host,
+                port: port ? parseInt(port, 10) : 5432,
+                database_name,
+                username,
+                password,
+                schema_name,
+                ssl: !!ssl,
+            });
+            const safe = await (0, dataSourceStore_1.getSafeDataSource)(pool, ds.id);
+            res.json({ success: true, dataSource: safe });
+        }
+        catch (err) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+    // DELETE /datasources/:idOrName - Delete a registered data source
+    router.delete('/datasources/:idOrName', async (req, res) => {
+        try {
+            const deleted = await (0, dataSourceStore_1.deleteDataSource)(pool, req.params.idOrName);
+            if (deleted) {
+                res.json({ success: true, message: `Data source ${req.params.idOrName} deleted.` });
+            }
+            else {
+                res.status(404).json({ error: `Data source ${req.params.idOrName} not found.` });
+            }
+        }
+        catch (err) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+    // POST /datasources/:idOrName/test - Test connection using stored data source credentials
+    router.post('/datasources/:idOrName/test', async (req, res) => {
+        try {
+            const ds = await (0, dataSourceStore_1.getDataSource)(pool, req.params.idOrName);
+            if (!ds) {
+                res.status(404).json({ error: `Data source ${req.params.idOrName} not found.` });
+                return;
+            }
+            const testResult = await (0, introspect_1.testDatabaseConnection)({
+                host: ds.host,
+                port: ds.port,
+                database: ds.database_name,
+                user: ds.username,
+                password: ds.password,
+                ssl: ds.ssl,
+            });
+            res.json(testResult);
+        }
+        catch (err) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+    // POST /datasources/preview-import - Preview batch import, conflict detection & join checks before commit
+    router.post('/datasources/preview-import', async (req, res) => {
+        try {
+            const { tables, options = {}, connection, dataSourceName, dataSource } = req.body;
+            if (!tables || !Array.isArray(tables) || tables.length === 0) {
+                res.status(400).json({ error: 'Array of "tables" is required' });
+                return;
+            }
+            const effectiveDataSource = dataSource || (connection && connection.host ? (dataSourceName || connection.database || 'remote_postgres') : undefined);
+            const cleanDsName = effectiveDataSource && effectiveDataSource !== 'default'
+                ? effectiveDataSource.toLowerCase().replace(/[^a-z0-9_]/g, '_')
+                : undefined;
+            // 1. Fetch existing models to detect conflicts
+            const existingActiveRes = await pool.query(`
+        SELECT sm.id, sm.name, sm.file_name, mr.content
+        FROM semantic_models sm
+        JOIN model_revisions mr ON sm.id = mr.model_id
+        WHERE sm.is_active = true AND mr.status = 'active'
+      `);
+            const existingFiles = existingActiveRes.rows.map(r => ({
+                fileName: r.file_name,
+                content: r.content,
+                readOnly: false,
+            }));
+            const existingModelMap = new Map(existingActiveRes.rows.map(r => [r.name, r]));
+            const existingCubeNames = new Set(existingActiveRes.rows.map(r => r.name));
+            // 2. Generate preview for each table
+            const previewItems = [];
+            const newFilesForValidation = [];
+            for (const table of tables) {
+                const gen = (0, introspect_1.generateCubeDef)(table, tables, {
+                    ...options,
+                    existingCubeNames,
+                    dataSource: cleanDsName,
+                });
+                const isConflict = existingModelMap.has(gen.cubeName);
+                const existingModel = existingModelMap.get(gen.cubeName);
+                previewItems.push({
+                    cubeName: gen.cubeName,
+                    fileName: gen.fileName,
+                    table: `${table.schema}.${table.name}`,
+                    isConflict,
+                    existingModelId: existingModel?.id,
+                    skippedJoins: gen.skippedJoins || [],
+                    joinsCount: gen.parsed.cubes[0]?.joins?.length || 0,
+                    dimensionsCount: gen.parsed.cubes[0]?.dimensions?.length || 0,
+                    measuresCount: gen.parsed.cubes[0]?.measures?.length || 0,
+                    yaml: gen.yaml,
+                    dataSource: cleanDsName || 'default',
+                });
+                newFilesForValidation.push({
+                    fileName: gen.fileName,
+                    content: gen.yaml,
+                });
+            }
+            // 3. Pre-validate against compiler
+            const validation = await (0, validator_1.validateBatchSchemas)(newFilesForValidation, existingFiles);
+            res.json({
+                success: true,
+                valid: validation.valid,
+                validationErrors: validation.valid ? [] : validation.errors,
+                warnings: validation.warnings || [],
+                summary: {
+                    total: previewItems.length,
+                    toCreate: previewItems.filter(p => !p.isConflict).length,
+                    toUpdate: previewItems.filter(p => p.isConflict).length,
+                    totalSkippedJoins: previewItems.reduce((acc, p) => acc + (p.skippedJoins?.length || 0), 0),
+                },
+                items: previewItems,
+            });
+        }
+        catch (err) {
+            res.status(500).json({ error: err.message });
+        }
+    });
     // POST /datasources/generate-cubes - Batch generate cubes from selected tables with FK joins, measures, and data sources
     router.post('/datasources/generate-cubes', async (req, res) => {
         try {
-            const { tables, options = {}, connection, dataSourceName } = req.body;
+            const { tables, options = {}, connection, dataSourceName, dataSource } = req.body;
             if (!tables || !Array.isArray(tables) || tables.length === 0) {
                 res.status(400).json({ error: 'Array of "tables" is required' });
                 return;
             }
             const actor = req.user?.actor || 'VAS Data Source Explorer';
-            // 1. Handle external data source registration if connection configuration is provided
+            // 1. Handle external data source registration or lookup
             let targetDataSource = undefined;
-            if (connection && connection.host) {
+            if (dataSource && dataSource !== 'default') {
+                targetDataSource = dataSource.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+            }
+            else if (connection && connection.host) {
                 // Derive clean data source identifier
                 const rawDsName = (dataSourceName || connection.dataSourceName || connection.database || 'remote_postgres');
                 const dsName = rawDsName.toLowerCase().replace(/[^a-z0-9_]/g, '_');

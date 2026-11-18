@@ -101,17 +101,35 @@ Globale versie/timestamp-teller voor Cube's `schemaVersion` hook.
 
 ---
 
-## 4. Fasering & Roadmap
+## 4. Fasering & Roadmap (afgestemd op Plan van Aanpak)
 
-| Fase | Onderdelen | Status |
-| :--- | :--- | :--- |
-| **Fase 1** | - PostgreSQL migratiescript (`001_initial_schema.sql`)<br>- Custom `repositoryFactory` implementation (`PostgresSchemaRepository`)<br>- `schemaVersion` tracker integratie in `cube.js`<br>- Import / Export utility voor lokale YAML/JS modellen<br>- Unit- en integratietests (15/15 geslaagd) | **✓ Voltooid** |
-| **Fase 2** | - Real-time validatie-engine met `@cubejs-backend/schema-compiler`<br>- Management REST API (`GET /models`, `POST /models/validate`, `POST /models`, `PUT /models/:id`, `POST /models/:id/rollback`, `GET /datasources/introspect`)<br>- Beveiliging met JWT / `CUBEJS_API_SECRET`<br>- API documentatie & tests | **✓ Voltooid** |
-| **Fase 3** | - Web-UI applicatie (React + Tailwind + Monaco Editor)<br>- Schema explorer, visuele formulieren en live split-view<br>- Versiebeheer & diff-viewer<br>- Ingebouwde SQL-API & Cube query tester | **✓ Voltooid** |
-| **Git Integratie** | - `GitService` (`git status`, `git diff`, `git log`, `git commit`, `git pull`, `git checkout`)<br>- REST API endpoints onder `/management/v1/git/...`<br>- Web-UI Git tabblad met live diff-viewer, branch switcher en commit/push modal<br>- Automatische synchronisatie tussen Git repository (`model/`) en PostgreSQL | **✓ Voltooid & Live** |
-| **Docker** | - `docker-compose.yml` met PostgreSQL (metadata) + Cube server (API + UI + SQL-API 15432)<br>- Hot-reload geverifieerd in live container | **✓ Voltooid & Live** |
-| **Beveiliging (SSAS/RBAC)** | - `checkSqlAuth` in `cube.js` voor authenticatie van BI-tools (Superset, PowerBI, Tableau)<br>- `queryRewrite` voor server-side Row-Level Security (RLS) en Object-Level Security (OLS)<br>- Interactief Security Dashboard & Live SQL Tester in Web-UI op `/admin` | **✓ Voltooid & Geverifieerd** |
-| **Data Sources & Schema Explorer** | - Brondatabase configurator (Default VAS DB of Externe PostgreSQL/DWH)<br>- Live verbindingstester met latency & schema detectie (`/datasources/test-connection`)<br>- Introspectie met automatische Foreign Key (relatie) detectie (`/datasources/introspect`)<br>- Batch Table Importer: selecteer tabellen en neem ze met 1 klik op in VAS met auto-dimensions, auto-measures en auto-joins (`/datasources/generate-cubes`) | **✓ Voltooid & Geverifieerd** |
+| Fase | Onderdeel & Scope | Status | Toelichting |
+| :--- | :--- | :--- | :--- |
+| **Fase 0** | **Scope, Baseline & Documentatie**<br>- Afbakening van use-cases, drivers en BI-clients<br>- Statuscontrole documentatie vs. code<br>- Expliciet benoemen wat buiten scope valt | **✓ Afgerond** | PostgreSQL als primaire driver, Apache Superset & REST als primaire BI-clients. Geen DAX/MDX/XMLA. |
+| **Fase 1** | **Databronnen als eerste-klas configuratie**<br>- `data_sources` tabel & `driverFactory` routing<br>- CRUD endpoints & afschermen van secrets<br>- Server-side verificatie i.p.v. vertrouwen op client | **In uitvoering** | Runtime multi-database driver gereed. CRUD-beheer en secret redacting worden afgerond. |
+| **Fase 2** | **Veilige en atomische modelimport**<br>- Pre-validatie (`validateBatchSchemas`)<br>- Atomaire transactie (`batchUpsertModels`) met 1 `schemaVersion` bump<br>- Conflictdetectie en UI-reviewstap vóór commit | **In uitvoering** | Backend atomische transactie & join filtering gereed. UI review-/conflictenstap in aanbouw. |
+| **Fase 3** | **Productiewaardige Identiteit & RBAC**<br>- Vervangen van demo-authenticatie door centrale identity provider / JWT<br>- Dynamische configuratie van RLS/OLS zonder hardcoding<br>- Afschermen / beveiligen van endpoints | **Gepland** | Huidige rollen (`admin`, `sales_amsterdam`, etc.) dienen uitsluitend als prototype verificatie. |
+| **Fase 4** | **Modelbeheer, Audit & Herstel**<br>- Optimistic concurrency bij gelijktijdige edits<br>- Gevalideerde rollbacks met audit trail<br>- Git vs DB reconciliatie en conflictresolutie | **Gepland** | Basis rollback en Git-integratie aanwezig; hardening voor concurrentie nodig. |
+| **Fase 5** | **Betrouwbaarheid, Observability & Performance**<br>- Gestructureerde logs, metrics en health checks<br>- Graceful handling bij database-uitval (geen leeg schema)<br>- Benchmarks en querylimits | **Gepland** | Basis `/health` endpoint aanwezig. |
+| **Fase 6** | **BI-compatibiliteit & Releasecriteria**<br>- Geautomatiseerde Superset testsuite<br>- Compatibility matrix en release checklist | **Gepland** | Handmatige Superset-wire verificatie geslaagd; geautomatiseerde suite volgt. |
+
+---
+
+## 5. Scope van de Initiële Release
+
+### Binnen Scope
+- **Brondatabases:** PostgreSQL (en PostgreSQL-compatibele DWH's zoals Timescale, CockroachDB).
+- **Consumenten / Protocollen:** 
+  1. Apache Superset via PostgreSQL Wire Protocol (poort 15432).
+  2. Web-UI en API-integraties via REST API (poorten 4000 en 4001).
+- **Semantische Capaciteiten:** Cubes, views, dimensions, measures (count, sum, avg, min, max), veilige joins (many_to_one) en pre-aggregaties.
+- **Transactiemodel:** Atomaire batch publicatie met zero-downtime hot-reload in Cube.
+
+### Expliciet Buiten Scope
+- Native SSAS MDX / DAX / XMLA queries (VAS gebruikt SQL- en Cube-REST interfaces).
+- Willekeurige niet-relationele NoSQL bronnen.
+- Multi-tenant hosting zonder vooraf vastgesteld netwerk- en tenant-isolatieontwerp.
+- Productiegebruik van ingebouwde demo-accounts (`admin`, `sales_amsterdam`, `sales_rotterdam`).
 
 ---
 
@@ -134,9 +152,12 @@ Globale versie/timestamp-teller voor Cube's `schemaVersion` hook.
 
 ---
 
-## 5. Beveiligingsarchitectuur (SSAS-stijl RBAC, RLS & OLS)
+## 7. Beveiligingsarchitectuur (SSAS-stijl RBAC, RLS & OLS Prototype)
 
-### Geconfigureerde Identiteiten & Rechten
+> [!NOTE]
+> Onderstaande accounts en beleidsregels zijn gerealiseerd als **verificatie-prototype** in `runtime/cube.js`. In Fase 3 van het Plan van Aanpak wordt dit vervangen door een centraal, extern configureerbaar RBAC-systeem met JWT/token-validatie en secrets management.
+
+### Geconfigureerde Prototype Identiteiten & Rechten (Verificatie)
 
 | Gebruikersnaam | Wachtwoord | Rol | RLS Beleid (Row-Level Security) | OLS Beleid (Object-Level Security) | Verwacht resultaat (`SELECT * FROM Orders`) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
