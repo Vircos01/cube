@@ -34,7 +34,7 @@ export async function startManagementServer(options: ManagementServerOptions = {
   app.use('/', createManagementRouter(pool, { apiSecret: options.apiSecret }));
 
   const server = app.listen(port, () => {
-    console.log(`🚀 Cube Management API & Web-UI running on http://localhost:${port}/admin`);
+    console.log(`🚀 VAS (Voxel Analytics Service) Web-UI running on http://localhost:${port}/admin`);
   });
 
   return { app, server, pool };

@@ -1,7 +1,7 @@
 {
   "name": "@cubejs-backend/management-api",
   "version": "1.8.27",
-  "description": "Dynamic Semantic Layer Management API and Web-UI backend for Cube Core",
+  "description": "VAS (Voxel Analytics Service) - Dynamic Semantic Layer Management API and Web-UI",
   "main": "dist/src/index.js",
   "typings": "dist/src/index.d.ts",
   "scripts": {

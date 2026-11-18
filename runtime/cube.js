@@ -17,7 +17,7 @@ try {
     pool,
     apiSecret: process.env.CUBEJS_API_SECRET || 'mysecretkey123'
   }).then(() => {
-    console.log('✨ Cube Core Semantic Web-UI running on http://localhost:4001/admin');
+    console.log('✨ VAS (Voxel Analytics Service) Web-UI running on http://localhost:4001/admin');
   }).catch(err => {
     console.error('Failed to start Management Server:', err);
   });
