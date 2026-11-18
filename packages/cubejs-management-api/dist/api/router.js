@@ -39,6 +39,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.createManagementRouter = createManagementRouter;
 const express_1 = __importStar(require("express"));
 const path_1 = __importDefault(require("path"));
+const pg_1 = require("pg");
 const modelStore_1 = require("../repository/modelStore");
 const validator_1 = require("../compiler/validator");
 const introspect_1 = require("./introspect");
@@ -351,6 +352,94 @@ function createManagementRouter(pool, options = {}) {
         }
         catch (err) {
             res.status(500).json({ error: err.message });
+        }
+    });
+    // ==========================================
+    // SECURITY & ACCESS CONTROL (SSAS / RBAC)
+    // ==========================================
+    // GET /security/roles - List configured RBAC roles and policies
+    router.get('/security/roles', async (req, res) => {
+        res.json({
+            sqlApiEndpoint: {
+                host: 'localhost',
+                port: parseInt(process.env.CUBEJS_PG_SQL_PORT || '15432', 10),
+                database: process.env.CUBEJS_DB_NAME || 'cubedb',
+                protocol: 'PostgreSQL Wire Protocol v3 (Superset, PowerBI, Tableau, psql)'
+            },
+            roles: [
+                {
+                    username: 'admin',
+                    password: 'admin',
+                    name: 'Global Administrator',
+                    role: 'admin',
+                    description: 'Volledige ongefilterde toegang tot alle data, alle rijen en alle maatstaven.',
+                    rlsPolicy: 'Geen beperkingen (ziet alle orders en gebruikers wereldwijd)',
+                    olsPolicy: 'Alle maatstaven toegestaan (count, total_amount, avg_order_value)',
+                    expectedRows: 7
+                },
+                {
+                    username: 'sales_amsterdam',
+                    password: 'amsterdam123',
+                    name: 'Sales Rep Amsterdam',
+                    role: 'sales_rep',
+                    description: 'Toegewezen aan regio Amsterdam. Automatische dynamische Row-Level Security.',
+                    rlsPolicy: 'Users.city = "Amsterdam" (ziet uitsluitend orders 1 & 2 van Amsterdamse klanten)',
+                    olsPolicy: 'Maatstaf "Orders.avg_order_value" afgeschermd (Access Denied bij opvragen)',
+                    expectedRows: 2
+                },
+                {
+                    username: 'sales_rotterdam',
+                    password: 'rotterdam123',
+                    name: 'Sales Rep Rotterdam',
+                    role: 'sales_rep',
+                    description: 'Toegewezen aan regio Rotterdam. Automatische dynamische Row-Level Security.',
+                    rlsPolicy: 'Users.city = "Rotterdam" (ziet uitsluitend orders 3 & 6 van Rotterdamse klanten)',
+                    olsPolicy: 'Standaard sales maatstaven (count, total_amount) toegestaan',
+                    expectedRows: 2
+                }
+            ]
+        });
+    });
+    // POST /security/test-sql - Execute SQL query against Cube SQL API as a specific role
+    router.post('/security/test-sql', async (req, res) => {
+        const { username, password, sql } = req.body;
+        if (!username || !password || !sql) {
+            res.status(400).json({ error: 'Fields "username", "password" and "sql" are required' });
+            return;
+        }
+        const pgPort = parseInt(process.env.CUBEJS_PG_SQL_PORT || '15432', 10);
+        // In Docker, cube runs inside the same container or host
+        const client = new pg_1.Client({
+            host: '127.0.0.1',
+            port: pgPort,
+            user: username,
+            password: password,
+            database: process.env.CUBEJS_DB_NAME || 'cubedb',
+            connectionTimeoutMillis: 4000
+        });
+        try {
+            await client.connect();
+            const startTime = Date.now();
+            const result = await client.query(sql);
+            const durationMs = Date.now() - startTime;
+            res.json({
+                success: true,
+                user: username,
+                durationMs,
+                rowCount: result.rows.length,
+                rows: result.rows,
+                fields: (result.fields || []).map((f) => f.name)
+            });
+        }
+        catch (err) {
+            res.status(400).json({
+                success: false,
+                user: username,
+                error: err.message
+            });
+        }
+        finally {
+            await client.end().catch(() => { });
         }
     });
     return router;

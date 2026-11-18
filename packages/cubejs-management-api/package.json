@@ -5,7 +5,7 @@
   "main": "dist/src/index.js",
   "typings": "dist/src/index.d.ts",
   "scripts": {
-    "build": "rm -rf dist && tsc",
+    "build": "rm -rf dist tsconfig.tsbuildinfo && tsc",
     "tsc": "tsc",
     "watch": "tsc -w",
     "unit": "jest --coverage",

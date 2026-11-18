@@ -12,4 +12,6 @@ RUN git config --global user.name "Cube Web-UI" \
     && git config --global init.defaultBranch master \
     && git config --global --add safe.directory "*"
 
+RUN mkdir -p /cube/conf/.cubestore && chown -R node:node /cube/conf
+
 USER node

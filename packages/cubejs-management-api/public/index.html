@@ -64,6 +64,13 @@
       const [pushToRemote, setPushToRemote] = useState(false);
       const [gitLoading, setGitLoading] = useState(false);
 
+      // Security / SSAS RBAC state
+      const [securityData, setSecurityData] = useState(null);
+      const [selectedSecurityUser, setSelectedSecurityUser] = useState('admin');
+      const [securitySql, setSecuritySql] = useState('SELECT count, total_amount, avg_order_value FROM Orders');
+      const [securitySqlResult, setSecuritySqlResult] = useState(null);
+      const [securityRunning, setSecurityRunning] = useState(false);
+
       const monacoRef = useRef(null);
       const editorInstance = useRef(null);
 
@@ -435,6 +442,43 @@
         }
       };
 
+      // Security / SSAS RBAC API helpers
+      const fetchSecurityRoles = async () => {
+        try {
+          const res = await fetch('/management/v1/security/roles', { headers: getHeaders() });
+          const data = await res.json();
+          setSecurityData(data);
+        } catch (e) {
+          console.error('Failed to load security roles:', e);
+        }
+      };
+
+      const handleRunSecuritySql = async (overrideSql) => {
+        const queryToRun = overrideSql || securitySql;
+        if (!securityData || !securityData.roles) return;
+        const roleObj = securityData.roles.find(r => r.username === selectedSecurityUser) || securityData.roles[0];
+
+        setSecurityRunning(true);
+        setSecuritySqlResult(null);
+        try {
+          const res = await fetch('/management/v1/security/test-sql', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({
+              username: roleObj.username,
+              password: roleObj.password,
+              sql: queryToRun
+            })
+          });
+          const data = await res.json();
+          setSecuritySqlResult(data);
+        } catch (err) {
+          setSecuritySqlResult({ success: false, error: err.message });
+        } finally {
+          setSecurityRunning(false);
+        }
+      };
+
       // Initialize Monaco Editor
       useEffect(() => {
         require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
@@ -470,6 +514,7 @@
         fetchGitBranches();
         fetchGitLog();
         fetchGitDiff();
+        fetchSecurityRoles();
       }, [apiSecret]);
 
       // Helper to update field in current form
@@ -686,6 +731,7 @@
                   {[
                     { id: 'editor', label: 'Visual & YAML Split-View' },
                     { id: 'git', label: '🌿 Git & Version Control' },
+                    { id: 'security', label: '🔐 Access Control (SSAS)' },
                     { id: 'revisions', label: 'DB Revisions & Rollback' },
                     { id: 'query', label: 'Query & SQL Tester' },
                     { id: 'introspect', label: 'Database Introspection' }
@@ -1186,6 +1232,291 @@
                         </div>
                       )}
                     </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB: SECURITY & ACCESS CONTROL (SSAS / RBAC) */}
+              {activeTab === 'security' && (
+                <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                  {/* Top Intro Banner */}
+                  <div className="bg-gradient-to-r from-slate-900 via-indigo-950/40 to-slate-900 border border-slate-800 p-5 rounded-xl">
+                    <div className="flex items-center space-x-3 mb-2">
+                      <span className="text-2xl">🔐</span>
+                      <div>
+                        <h2 className="text-base font-bold text-slate-100">
+                          Role-Based Access Control (RBAC) & Dynamic Security (SSAS-Equivalent)
+                        </h2>
+                        <p className="text-xs text-slate-400">
+                          Ondersteuning voor Row-Level Security (RLS) en Column/Measure-Level Security (OLS). BI-tools zoals Apache Superset verbinden via poort 15432.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 3 Configured Roles Grid */}
+                  <div className="grid grid-cols-3 gap-4">
+                    {/* Admin */}
+                    <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col justify-between space-y-3">
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="font-bold text-slate-200 text-sm">Global Administrator</span>
+                          <span className="text-[10px] bg-emerald-950 text-emerald-300 border border-emerald-800 px-2 py-0.5 rounded-full font-mono font-semibold">Superuser</span>
+                        </div>
+                        <div className="text-xs font-mono text-indigo-400 mb-2">User: admin / admin</div>
+                        <p className="text-xs text-slate-400 mb-3">Volledige ongefilterde toegang tot alle data en gevoelige maatstaven.</p>
+                        <div className="space-y-1 text-xs">
+                          <div className="flex items-start space-x-1.5 text-slate-300">
+                            <span className="text-emerald-400 font-bold">✓</span>
+                            <span><strong>RLS:</strong> Geen filter (alle 7 orders)</span>
+                          </div>
+                          <div className="flex items-start space-x-1.5 text-slate-300">
+                            <span className="text-emerald-400 font-bold">✓</span>
+                            <span><strong>OLS:</strong> Alle maatstaven toegestaan</span>
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => {
+                          setSelectedSecurityUser('admin');
+                          setSecuritySql('SELECT count, total_amount, avg_order_value FROM Orders');
+                          handleRunSecuritySql('SELECT count, total_amount, avg_order_value FROM Orders');
+                        }}
+                        className="w-full mt-2 text-xs py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
+                      >
+                        Selecteer & Test Query
+                      </button>
+                    </div>
+
+                    {/* Sales Amsterdam */}
+                    <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col justify-between space-y-3">
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="font-bold text-slate-200 text-sm">Sales Rep Amsterdam</span>
+                          <span className="text-[10px] bg-amber-950 text-amber-300 border border-amber-800 px-2 py-0.5 rounded-full font-mono font-semibold">RLS + OLS Actief</span>
+                        </div>
+                        <div className="text-xs font-mono text-indigo-400 mb-2">User: sales_amsterdam / amsterdam123</div>
+                        <p className="text-xs text-slate-400 mb-3">Dynamische RLS filtert data automatisch op Amsterdam. OLS blokkeert avg_order_value.</p>
+                        <div className="space-y-1 text-xs">
+                          <div className="flex items-start space-x-1.5 text-slate-300">
+                            <span className="text-amber-400 font-bold">●</span>
+                            <span><strong>RLS:</strong> Users.city = 'Amsterdam' (2 orders)</span>
+                          </div>
+                          <div className="flex items-start space-x-1.5 text-rose-300">
+                            <span className="text-rose-400 font-bold">✗</span>
+                            <span><strong>OLS:</strong> avg_order_value geblokkeerd</span>
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => {
+                          setSelectedSecurityUser('sales_amsterdam');
+                          setSecuritySql('SELECT count, total_amount FROM Orders');
+                          handleRunSecuritySql('SELECT count, total_amount FROM Orders');
+                        }}
+                        className="w-full mt-2 text-xs py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
+                      >
+                        Selecteer & Test Query
+                      </button>
+                    </div>
+
+                    {/* Sales Rotterdam */}
+                    <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col justify-between space-y-3">
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="font-bold text-slate-200 text-sm">Sales Rep Rotterdam</span>
+                          <span className="text-[10px] bg-blue-950 text-blue-300 border border-blue-800 px-2 py-0.5 rounded-full font-mono font-semibold">RLS Actief</span>
+                        </div>
+                        <div className="text-xs font-mono text-indigo-400 mb-2">User: sales_rotterdam / rotterdam123</div>
+                        <p className="text-xs text-slate-400 mb-3">Dynamische RLS filtert data automatisch op Rotterdamse klanten en bestellingen.</p>
+                        <div className="space-y-1 text-xs">
+                          <div className="flex items-start space-x-1.5 text-slate-300">
+                            <span className="text-blue-400 font-bold">●</span>
+                            <span><strong>RLS:</strong> Users.city = 'Rotterdam' (2 orders)</span>
+                          </div>
+                          <div className="flex items-start space-x-1.5 text-slate-300">
+                            <span className="text-emerald-400 font-bold">✓</span>
+                            <span><strong>OLS:</strong> Sales metrics toegestaan</span>
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => {
+                          setSelectedSecurityUser('sales_rotterdam');
+                          setSecuritySql('SELECT count, total_amount FROM Orders');
+                          handleRunSecuritySql('SELECT count, total_amount FROM Orders');
+                        }}
+                        className="w-full mt-2 text-xs py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
+                      >
+                        Selecteer & Test Query
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Apache Superset & BI Connection info */}
+                  <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 text-xs">
+                    <div className="font-bold text-slate-200 mb-1 flex items-center space-x-2">
+                      <span>📊</span>
+                      <span>Apache Superset / PowerBI / Tableau Verbindingsparameters</span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-3 mt-2 font-mono text-slate-400">
+                      <div className="bg-slate-950 p-2 rounded border border-slate-800">
+                        <span className="text-slate-500 block text-[10px]">HOST</span>
+                        <span className="text-indigo-300">localhost</span>
+                      </div>
+                      <div className="bg-slate-950 p-2 rounded border border-slate-800">
+                        <span className="text-slate-500 block text-[10px]">PORT (SQL-API)</span>
+                        <span className="text-indigo-300">15432</span>
+                      </div>
+                      <div className="bg-slate-950 p-2 rounded border border-slate-800">
+                        <span className="text-slate-500 block text-[10px]">DATABASE</span>
+                        <span className="text-indigo-300">cubedb</span>
+                      </div>
+                      <div className="bg-slate-950 p-2 rounded border border-slate-800">
+                        <span className="text-slate-500 block text-[10px]">PROTOCOL</span>
+                        <span className="text-emerald-400">PostgreSQL Wire v3</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Interactive Live SQL Tester */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-200">Interactive Security & RLS/OLS Tester</h3>
+                        <p className="text-xs text-slate-400">Voer live SQL-queries uit tegen Cube SQL-API onder een gekozen identiteit</p>
+                      </div>
+
+                      <div className="flex items-center space-x-2">
+                        <label className="text-xs text-slate-400 font-medium">Actieve Identiteit:</label>
+                        <select
+                          value={selectedSecurityUser}
+                          onChange={(e) => setSelectedSecurityUser(e.target.value)}
+                          className="bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs font-semibold text-indigo-300 focus:outline-none focus:border-indigo-500"
+                        >
+                          <option value="admin">Global Administrator (admin)</option>
+                          <option value="sales_amsterdam">Sales Rep Amsterdam (sales_amsterdam)</option>
+                          <option value="sales_rotterdam">Sales Rep Rotterdam (sales_rotterdam)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Quick Queries */}
+                    <div className="flex items-center space-x-2 text-xs">
+                      <span className="text-slate-400 font-medium">Snelle test queries:</span>
+                      <button
+                        onClick={() => {
+                          const q = 'SELECT count, total_amount, avg_order_value FROM Orders';
+                          setSecuritySql(q);
+                          handleRunSecuritySql(q);
+                        }}
+                        className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded"
+                      >
+                        1. Alle Maatstaven
+                      </button>
+                      <button
+                        onClick={() => {
+                          const q = 'SELECT count, total_amount FROM Orders';
+                          setSecuritySql(q);
+                          handleRunSecuritySql(q);
+                        }}
+                        className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded"
+                      >
+                        2. Sales Metrics Alleen
+                      </button>
+                      <button
+                        onClick={() => {
+                          const q = 'SELECT avg_order_value FROM Orders';
+                          setSecuritySql(q);
+                          handleRunSecuritySql(q);
+                        }}
+                        className="bg-rose-950/70 hover:bg-rose-900 border border-rose-800/60 text-rose-300 px-2.5 py-1 rounded"
+                        title="Zal geblokkeerd worden voor sales_amsterdam door Object-Level Security!"
+                      >
+                        3. Gevoelig Veld (OLS Test) ⚠️
+                      </button>
+                      <button
+                        onClick={() => {
+                          const q = 'SELECT Orders.id, Users.name, Users.city, Orders.amount FROM Orders JOIN Users';
+                          setSecuritySql(q);
+                          handleRunSecuritySql(q);
+                        }}
+                        className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded"
+                      >
+                        4. Orders + Klant (Join)
+                      </button>
+                    </div>
+
+                    {/* Query Input + Run */}
+                    <div className="flex space-x-3">
+                      <input
+                        type="text"
+                        value={securitySql}
+                        onChange={(e) => setSecuritySql(e.target.value)}
+                        className="flex-1 bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-indigo-500"
+                        placeholder="SELECT count, total_amount FROM Orders"
+                      />
+                      <button
+                        onClick={() => handleRunSecuritySql()}
+                        disabled={securityRunning}
+                        className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-semibold shadow disabled:opacity-50"
+                      >
+                        {securityRunning ? 'Uitvoeren...' : '▶ Voer SQL Uit'}
+                      </button>
+                    </div>
+
+                    {/* Query Result Box */}
+                    {securitySqlResult && (
+                      <div className="border border-slate-800 rounded-lg overflow-hidden bg-slate-950">
+                        {securitySqlResult.success ? (
+                          <div>
+                            <div className="bg-slate-900/90 px-4 py-2 border-b border-slate-800 flex items-center justify-between text-xs">
+                              <div className="flex items-center space-x-3">
+                                <span className="text-emerald-400 font-bold">✓ Succesvol uitgevoerd</span>
+                                <span className="text-slate-400">Gebruiker: <strong className="text-indigo-300 font-mono">{securitySqlResult.user}</strong></span>
+                              </div>
+                              <div className="flex items-center space-x-3 text-slate-400 font-mono">
+                                <span>{securitySqlResult.rowCount} rijen</span>
+                                <span>{securitySqlResult.durationMs}ms</span>
+                              </div>
+                            </div>
+                            <div className="max-h-64 overflow-auto">
+                              <table className="w-full text-left text-xs font-mono">
+                                <thead>
+                                  <tr className="border-b border-slate-800 bg-slate-900/50 text-slate-400">
+                                    {(securitySqlResult.fields || []).map(f => (
+                                      <th key={f} className="p-2.5">{f}</th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {(securitySqlResult.rows || []).map((row, rIdx) => (
+                                    <tr key={rIdx} className="border-b border-slate-800/40 hover:bg-slate-900/50 text-slate-200">
+                                      {securitySqlResult.fields.map((f, cIdx) => (
+                                        <td key={cIdx} className="p-2.5">{String(row[f] !== undefined ? row[f] : '')}</td>
+                                      ))}
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="p-4 bg-rose-950/40 border border-rose-800 text-rose-200 text-xs rounded-lg space-y-2">
+                            <div className="font-bold flex items-center space-x-2 text-rose-300 text-sm">
+                              <span>🛑</span>
+                              <span>Toegang Geweigerd / Query Fout:</span>
+                            </div>
+                            <div className="font-mono bg-rose-950/90 p-3 rounded border border-rose-800/80 text-[11px] whitespace-pre-wrap">
+                              {securitySqlResult.error}
+                            </div>
+                            <p className="text-slate-400 text-[11px]">
+                              Deze blokkade werd server-side afgedwongen door Cube Core's <code>queryRewrite</code> / OLS beleid voordat de SQL naar de database kon worden gestuurd.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

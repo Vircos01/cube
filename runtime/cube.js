@@ -63,5 +63,106 @@ module.exports = {
       console.error('[schemaVersion] Error reading version tracker:', err.message);
       return 'fallback_version';
     }
+  },
+
+  // 1. SQL-API Authentication Hook (PostgreSQL-wire protocol / Apache Superset / BI tools)
+  checkSqlAuth: async (req, user, password) => {
+    console.log(`[checkSqlAuth] Authenticating SQL user: '${user}'`);
+
+    // Rol 1: Global Admin - volledige ongefilterde toegang
+    if (user === 'admin' && password === 'admin') {
+      return {
+        password: 'admin',
+        superuser: true,
+        securityContext: {
+          username: 'admin',
+          name: 'Global Administrator',
+          role: 'admin'
+        }
+      };
+    }
+
+    // Rol 2: Sales Rep Amsterdam - RLS actief (alleen Amsterdam), OLS actief (geen avg_order_value)
+    if (user === 'sales_amsterdam' && password === 'amsterdam123') {
+      return {
+        password: 'amsterdam123',
+        superuser: false,
+        securityContext: {
+          username: 'sales_amsterdam',
+          name: 'Amsterdam Sales Representative',
+          role: 'sales_rep',
+          city: 'Amsterdam',
+          denyMeasures: ['Orders.avg_order_value']
+        }
+      };
+    }
+
+    // Rol 3: Sales Rep Rotterdam - RLS actief (alleen Rotterdam)
+    if (user === 'sales_rotterdam' && password === 'rotterdam123') {
+      return {
+        password: 'rotterdam123',
+        superuser: false,
+        securityContext: {
+          username: 'sales_rotterdam',
+          name: 'Rotterdam Sales Representative',
+          role: 'sales_rep',
+          city: 'Rotterdam'
+        }
+      };
+    }
+
+    // Fallback voor standaard cube user
+    if (user === 'cube' && password === 'cube') {
+      return {
+        password: 'cube',
+        superuser: true,
+        securityContext: { role: 'admin', username: 'cube' }
+      };
+    }
+
+    throw new Error(`[Authentication Failed] Ongeldige inloggegevens voor SQL user: '${user}'`);
+  },
+
+  // 2. QueryRewrite Hook: Dynamische RLS & OLS handhaving (werkt voor SQL-API én REST-API)
+  queryRewrite: async (query, { securityContext }) => {
+    // Admin heeft altijd volledige ongefilterde toegang
+    if (!securityContext || securityContext.role === 'admin' || securityContext.superuser) {
+      return query;
+    }
+
+    console.log(`[queryRewrite] Actieve beveiligingspolicy voor user: '${securityContext.username}', rol: '${securityContext.role}'`);
+
+    // A. Object-Level Security (OLS): Kolommen / Maatstaven blokkeren voor niet-geautoriseerde rollen
+    if (securityContext.denyMeasures && Array.isArray(securityContext.denyMeasures)) {
+      const requestedMeasures = query.measures || [];
+      for (const denied of securityContext.denyMeasures) {
+        if (requestedMeasures.includes(denied)) {
+          throw new Error(
+            `[Access Denied] Maatstaf '${denied}' is afgeschermd (Object-Level Security) en niet toegankelijk voor rol '${securityContext.role}'.`
+          );
+        }
+      }
+    }
+
+    // B. Row-Level Security (RLS): Data dynamisch filteren op rijniveau
+    const allQueryMembers = [
+      ...(query.measures || []),
+      ...(query.dimensions || []),
+      ...(query.segments || []),
+      ...((query.filters || []).map(f => f.member || ''))
+    ];
+    const touchesOrdersOrUsers = allQueryMembers.some(m => m.startsWith('Orders.') || m.startsWith('Users.'));
+
+    if (touchesOrdersOrUsers && securityContext.city) {
+      query.filters = query.filters || [];
+      query.filters.push({
+        member: 'Users.city',
+        operator: 'equals',
+        values: [securityContext.city]
+      });
+      console.log(`[queryRewrite] RLS filter geactiveerd: Users.city = '${securityContext.city}'`);
+    }
+
+    return query;
   }
 };
